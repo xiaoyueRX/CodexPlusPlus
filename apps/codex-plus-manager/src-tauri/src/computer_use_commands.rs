@@ -24,8 +24,10 @@ pub async fn computer_use_status() -> CommandResult<Value> {
         Ok(report) => {
             let message = if report.runtime_found {
                 "已找到 Codex 运行时。"
-            } else {
+            } else if cfg!(target_os = "macos") {
                 "未找到 ChatGPT.app，Computer Use 暂时不可接入。"
+            } else {
+                "未找到 Codex 运行时，Computer Use 暂时不可接入。"
             };
             ok(
                 message,
@@ -222,25 +224,40 @@ pub async fn computer_use_check() -> CommandResult<Value> {
     }
 }
 
-/// 打开 ChatGPT.app。运行时缺失时给用户一个明确的下一步动作。
+/// 打开 ChatGPT 桌面应用。
 #[tauri::command]
 pub async fn computer_use_open_app() -> CommandResult<Value> {
     let result = run_blocking(|| -> anyhow::Result<String> {
         let runtime = codex_plus_core::computer_use::locate_runtime()?
-            .ok_or_else(|| anyhow::anyhow!("未找到 ChatGPT.app"))?;
+            .ok_or_else(|| anyhow::anyhow!("未找到 Codex 桌面应用"))?;
         Ok(runtime.app_path)
     })
     .await;
     match result {
         Ok(app_path) => {
-            let status = std::process::Command::new("open").arg(&app_path).status();
-            match status {
-                Ok(status) if status.success() => ok(
-                    "已打开 ChatGPT；请确认 Computer Use 的辅助功能与屏幕录制权限已授予。",
+            #[cfg(target_os = "macos")]
+            let launch_res = std::process::Command::new("open").arg(&app_path).status()
+                .map(|s| (s.success(), s.code()));
+            #[cfg(not(target_os = "macos"))]
+            let launch_res = {
+                let path = std::path::Path::new(&app_path);
+                let exe = if path.is_file() {
+                    path.to_path_buf()
+                } else {
+                    codex_plus_core::app_paths::build_codex_executable(path)
+                };
+                std::process::Command::new(&exe)
+                    .spawn()
+                    .map(|_| (true, Some(0)))
+                    .map_err(|e| std::io::Error::new(e.kind(), e.to_string()))
+            };
+            match launch_res {
+                Ok((true, _)) => ok(
+                    "已打开 ChatGPT。",
                     json!({ "appPath": app_path }),
                 ),
-                Ok(status) => failed(
-                    &format!("打开 ChatGPT 失败（退出码 {:?}）", status.code()),
+                Ok((false, code)) => failed(
+                    &format!("打开 ChatGPT 失败（退出码 {:?}）", code),
                     json!({ "appPath": app_path }),
                 ),
                 Err(error) => failed(&format!("打开 ChatGPT 失败：{error}"), json!({})),

@@ -124,9 +124,9 @@ function stateLabel(state: CuTargetState): string {
 }
 function failureText(check: CuCheck): string {
   switch (check.failureKind) {
-    case "runtime_missing": return t("没找到 ChatGPT.app，请先安装 Codex 桌面版");
-    case "untrusted_parent": return t("Computer Use 拒绝了本次调用：ChatGPT.app 版本不兼容，请更新后再试");
-    case "permission_required": return t("请在系统设置里给 ChatGPT 授予辅助功能/屏幕录制权限");
+    case "runtime_missing": return t("没找到 Codex 桌面版，请先安装后再试");
+    case "untrusted_parent": return t("Computer Use 拒绝了本次调用：Codex 桌面版版本不兼容，请更新后再试");
+    case "permission_required": return t("请在系统设置里给 Codex 授予辅助功能/屏幕录制权限");
     case "client_unsupported": return t("当前客户端不支持审批卡（elicitation）");
     case "service_unavailable": return t("Computer Use 服务未就绪，先打开一次 Codex 的 Computer Use");
     case "error": return check.failureDetail || check.message || t("自检失败，请查看详情后重试。");
@@ -329,8 +329,8 @@ export function ComputerUsePage() {
     try {
       const result = await invoke<CuResult>("computer_use_open_app");
       if (!mounted.current || epoch.current !== stamp) return;
-      if (result.status === "ok") setNotice(t("已请求打开 ChatGPT.app。"));
-      else setActionError(result.message || t("打开 ChatGPT.app 失败。"));
+      if (result.status === "ok") setNotice(t("已请求打开 Codex。"));
+      else setActionError(result.message || t("打开 Codex 失败。"));
     } catch (reason) {
       if (mounted.current && epoch.current === stamp) setActionError(errorText(reason));
     } finally {
@@ -600,7 +600,7 @@ export function ComputerUsePage() {
       <div className="cu-card-head">
         <div>
           <h2 id="cu-flow-title">{t("工作原理")}</h2>
-          <p>{t("Codex++ 把 ChatGPT.app 里现成的 Computer Use 与 Chrome 扩展，通过 MCP 转给其它 AI 客户端。左边点「接入」；操作方式、审批与悬浮预览在图下方设置。")}</p>
+          <p>{t("Codex++ 把 Codex 桌面版里现成的 Computer Use 与 Chrome 扩展，通过 MCP 转给其它 AI 客户端。左边点「接入」；操作方式、审批与悬浮预览在图下方设置。")}</p>
         </div>
       </div>
       <HubTopology links={links}>
@@ -627,7 +627,7 @@ export function ComputerUsePage() {
         <div className="hub-col">
           <div className="hub-col-head"><span>{t("被操作的对象")}</span><span /></div>
           {flowTarget("cu-target:desktop", <AppWindow size={16} />, t("本机桌面应用"),
-            !status ? t("检测中…") : found ? t("经 ChatGPT.app 原生 Computer Use") : t("未找到 ChatGPT.app，先安装 Codex 桌面版"),
+            !status ? t("检测中…") : found ? t("经 Codex 原生 Computer Use") : t("未找到 Codex 桌面版，请先安装"),
             Boolean(status) && !found)}
           {flowTarget("cu-target:chrome", <Globe size={16} />, t("Chrome 标签页"),
             extStatus == null ? t("检测中…") : chromeReady ? t("经 ChatGPT for Chrome 扩展，用你已登录的浏览器") : t("未安装 ChatGPT for Chrome 扩展"),
@@ -760,11 +760,11 @@ export function ComputerUsePage() {
       {status && !found && <div className="cu-runtime-missing" role="status">
         <AlertTriangle size={16} />
         <div>
-          <strong>{t("没找到 ChatGPT.app")}</strong>
+          <strong>{t("没找到 Codex 桌面版")}</strong>
           <p>{status.configHint || t("请先安装 Codex 桌面版，安装后点「重新检测」。")}</p>
         </div>
         <button className="mg-button" type="button" onClick={() => void openChatGpt()} disabled={locked}>
-          {busy === "open" ? <Loader2 size={14} className="cu-spin" /> : <Play size={14} />}{busy === "open" ? t("正在打开…") : t("打开 ChatGPT")}
+          {busy === "open" ? <Loader2 size={14} className="cu-spin" /> : <Play size={14} />}{busy === "open" ? t("正在打开…") : t("打开 Codex")}
         </button>
       </div>}
 
@@ -912,7 +912,7 @@ export function ComputerUsePage() {
           <div className="cu-card-head">
             <div>
               <h2 id="cu-runtime-title">{t("运行时")}</h2>
-              <p>{t("Computer Use 的服务由本机 ChatGPT.app 提供，接入前先确认它能被找到。")}</p>
+              <p>{t("Computer Use 的服务由本机 Codex 桌面版提供，接入前先确认它能被找到。")}</p>
             </div>
             <span className="cu-badge" data-state={!status ? "unknown" : found ? "ok" : "missing"}>{!status ? t("未检测") : found ? t("已找到") : t("未找到")}</span>
           </div>

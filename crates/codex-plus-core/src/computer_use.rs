@@ -171,7 +171,8 @@ fn workbuddy_config_dir() -> PathBuf {
 }
 
 /// 拉起原生 CU server 时从当前环境透传的变量，与 Codex 的 `DEFAULT_ENV_VARS`（Unix）一致。
-const NATIVE_ENV_PASSTHROUGH: [&str; 11] = [
+/// Linux 下同时透传 X11/Wayland 桌面显示变量，否则无法连接窗口服务。
+const NATIVE_ENV_PASSTHROUGH: [&str; 17] = [
     "HOME",
     "LOGNAME",
     "PATH",
@@ -183,6 +184,12 @@ const NATIVE_ENV_PASSTHROUGH: [&str; 11] = [
     "TERM",
     "TMPDIR",
     "TZ",
+    "DISPLAY",
+    "XAUTHORITY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
+    "DBUS_SESSION_BUS_ADDRESS",
 ];
 
 /// 代理变量。浏览器面打开新网站前要联网做一次安全检查（Codex 里借道应用自己的通道，
@@ -389,6 +396,12 @@ impl RuntimeLocation {
         if let Some(cli) = &self.codex_cli {
             env.insert("CODEX_CLI_PATH".into(), cli.clone());
         }
+        #[cfg(target_os = "linux")]
+        {
+            if !env.contains_key("DISPLAY") && std::path::Path::new("/tmp/.X11-unix/X0").exists() {
+                env.insert("DISPLAY".into(), ":0".into());
+            }
+        }
         env.extend(proxy_env());
         env
     }
@@ -529,21 +542,57 @@ pub struct HealthReport {
 // 运行时定位
 // ---------------------------------------------------------------------------
 
+fn resolve_resources(app_path: &Path) -> PathBuf {
+    let mac_resources = app_path.join("Contents/Resources");
+    if mac_resources.is_dir() {
+        return mac_resources;
+    }
+    let linux_resources = app_path.join("resources");
+    if linux_resources.is_dir() {
+        return linux_resources;
+    }
+    let windows_resources = app_path.join("Resources");
+    if windows_resources.is_dir() {
+        return windows_resources;
+    }
+    mac_resources
+}
+
 /// 找本机的 Codex CU 运行时。找不到就返回 `Ok(None)`，由调用方决定怎么提示。
 pub fn locate_runtime() -> anyhow::Result<Option<RuntimeLocation>> {
     let codex_home = crate::codex_home::default_codex_home_dir();
-    // 原生 CU server 由 Codex 的安装器放在 codex home 下，不随 app 走。
-    let client = codex_home
+    // 原生 CU server（macOS 上由 Codex 安装在 codex home 下；Linux 上位于 resources/cua_node/...）
+    let mac_client = codex_home
         .join("computer-use/Codex Computer Use.app")
         .join("Contents/SharedSupport/SkyComputerUseClient.app")
         .join("Contents/MacOS/SkyComputerUseClient");
     for app_path in candidate_app_paths() {
-        let resources = app_path.join("Contents/Resources");
-        let node = resources.join("cua_node/bin/node");
+        let resources = resolve_resources(&app_path);
+        let node = if cfg!(windows) {
+            resources.join(r"cua_node\bin\node.exe")
+        } else {
+            resources.join("cua_node/bin/node")
+        };
         let cua_repl = resources.join("cua_node/lib/node_modules/@oai/cua-repl/bin/cua-repl.mjs");
-        let node_repl = resources.join("cua_node/bin/node_repl");
-        // 直通路径只需要 node + 原生 client；cua-repl 只服务 Codex 目标的兼容条目。
-        if !(node.is_file() && client.is_file()) {
+        let node_repl = if cfg!(windows) {
+            resources.join(r"cua_node\bin\node_repl.exe")
+        } else {
+            resources.join("cua_node/bin/node_repl")
+        };
+        let linux_client = resources.join("cua_node/lib/node_modules/@oai/cua/bin/linux/sky_linux_x64");
+        let linux_client_alt = resources.join("cua_node/lib/node_modules/@oai/sky/bin/linux/sky_linux_x64");
+        let client = if mac_client.is_file() {
+            mac_client.clone()
+        } else if linux_client.is_file() {
+            linux_client
+        } else if linux_client_alt.is_file() {
+            linux_client_alt
+        } else {
+            mac_client.clone()
+        };
+
+        // 只要 node 可用，且 client 或 cua_repl 任一存在即可（JS 模式直接使用 node + cua_repl）
+        if !node.is_file() || !(client.is_file() || cua_repl.is_file()) {
             continue;
         }
         let module_dirs = resources.join("cua_node/lib/node_modules");
@@ -552,16 +601,25 @@ pub fn locate_runtime() -> anyhow::Result<Option<RuntimeLocation>> {
             .join("computer-use/Codex Computer Use.app")
             .is_dir()
             .then(|| codex_home.join("computer-use/Codex Computer Use.app"));
-        let codex_cli = resources
+        let codex_cli = if resources
             .join("codex-cli/CodexCLI.app/Contents/MacOS/codex")
             .is_file()
-            .then(|| {
+        {
+            Some(
                 resources
                     .join("codex-cli/CodexCLI.app/Contents/MacOS/codex")
                     .to_string_lossy()
-                    .into_owned()
-            });
-        let app_version = read_bundle_version(&app_path);
+                    .into_owned(),
+            )
+        } else if resources.join("codex").is_file() {
+            Some(resources.join("codex").to_string_lossy().into_owned())
+        } else if Path::new("/usr/bin/codex").is_file() {
+            Some("/usr/bin/codex".to_string())
+        } else {
+            None
+        };
+        let app_version = read_bundle_version(&app_path)
+            .or_else(|| crate::app_paths::codex_app_version(&app_path));
         return Ok(Some(RuntimeLocation {
             app_path: app_path.to_string_lossy().into_owned(),
             node: node.to_string_lossy().into_owned(),
@@ -597,49 +655,80 @@ pub fn ensure_shim() -> anyhow::Result<PathBuf> {
 }
 
 fn candidate_app_paths() -> Vec<PathBuf> {
-    let mut paths = vec![
-        PathBuf::from("/Applications/ChatGPT.app"),
-        PathBuf::from("/Applications/Codex.app"),
-    ];
-    if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
-        paths.push(home.join("Applications/ChatGPT.app"));
-        paths.push(home.join("Applications/Codex.app"));
+    let mut paths = Vec::new();
+    if let Some(app) = crate::app_paths::resolve_codex_app_dir(None) {
+        paths.push(app);
     }
-    // Spotlight 兜底：应用可能被改过名字或装在非标准位置。
-    if let Ok(output) = Command::new("mdfind")
-        .arg("kMDItemCFBundleIdentifier == \"com.openai.chat\"")
-        .stderr(Stdio::null())
-        .output()
-        && output.status.success()
+    #[cfg(target_os = "macos")]
     {
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let line = line.trim();
-            if line.ends_with(".app") {
-                paths.push(PathBuf::from(line));
+        paths.push(PathBuf::from("/Applications/ChatGPT.app"));
+        paths.push(PathBuf::from("/Applications/Codex.app"));
+        if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+            paths.push(home.join("Applications/ChatGPT.app"));
+            paths.push(home.join("Applications/Codex.app"));
+        }
+        // Spotlight 兜底：应用可能被改过名字或装在非标准位置。
+        if let Ok(output) = Command::new("mdfind")
+            .arg("kMDItemCFBundleIdentifier == \"com.openai.chat\"")
+            .stderr(Stdio::null())
+            .output()
+            && output.status.success()
+        {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let line = line.trim();
+                if line.ends_with(".app") {
+                    paths.push(PathBuf::from(line));
+                }
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        paths.push(PathBuf::from("/usr/lib/chatgpt"));
+        paths.push(PathBuf::from("/opt/chatgpt"));
+        paths.push(PathBuf::from("/opt/ChatGPT"));
+        if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+            paths.push(home.join("Applications/chatgpt"));
+            paths.push(home.join(".local/share/chatgpt"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
+            paths.push(home.join(r"AppData\Local\Programs\ChatGPT"));
+            paths.push(home.join(r"AppData\Local\Programs\Codex"));
+        }
+    }
+    paths.dedup();
     paths
 }
 
 /// 读 `CFBundleShortVersionString`。CU 服务用它做客户端版本校验。
 fn read_bundle_version(app_path: &Path) -> Option<String> {
-    let plist = app_path.join("Contents/Info.plist");
-    if !plist.is_file() {
-        return None;
+    #[cfg(target_os = "macos")]
+    {
+        let plist = app_path.join("Contents/Info.plist");
+        if !plist.is_file() {
+            return None;
+        }
+        let output = Command::new("/usr/bin/plutil")
+            .args(["-extract", "CFBundleShortVersionString", "raw", "-o", "-"])
+            .arg(&plist)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!text.is_empty()).then_some(text)
     }
-    let output = Command::new("/usr/bin/plutil")
-        .args(["-extract", "CFBundleShortVersionString", "raw", "-o", "-"])
-        .arg(&plist)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app_path;
+        None
     }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
 }
 
 fn read_package_version(path: &Path) -> Option<String> {
@@ -1021,7 +1110,13 @@ pub fn status() -> anyhow::Result<StatusReport> {
             .and_then(|item| item.package_version.clone()),
         service_path: runtime.as_ref().and_then(|item| item.service_path.clone()),
         config_hint: runtime.is_none().then(|| {
-            "未找到 ChatGPT.app：请先安装 Codex 桌面版，或把应用放进 /Applications".to_string()
+            if cfg!(target_os = "macos") {
+                "未找到 ChatGPT.app：请先安装 Codex 桌面版，或把应用放进 /Applications".to_string()
+            } else if cfg!(target_os = "linux") {
+                "未找到 Codex 运行时：请先安装官方 Codex 桌面版（/usr/lib/chatgpt 或 /opt/chatgpt）".to_string()
+            } else {
+                "未找到 Codex 运行时：请先安装官方 Codex 桌面版".to_string()
+            }
         }),
         targets,
         custom_targets,
@@ -1656,7 +1751,7 @@ fn run_probe(_runtime: &RuntimeLocation) -> HealthReport {
                 kill_tree(&mut child);
                 return HealthReport {
                     ok: true,
-                    target: "mac".into(),
+                    target: std::env::consts::OS.into(),
                     app_count: Some(count),
                     // 原生 CU server 没有浏览器面，浏览器能力由独立 server 提供。
                     browser_count: None,
@@ -1705,7 +1800,7 @@ fn run_probe(_runtime: &RuntimeLocation) -> HealthReport {
 fn probe_failure(kind: &str, detail: &str) -> HealthReport {
     HealthReport {
         ok: false,
-        target: "mac".into(),
+        target: std::env::consts::OS.into(),
         app_count: None,
         browser_count: None,
         sample_apps: vec![],
@@ -2078,6 +2173,26 @@ mod tests {
         }
         assert_eq!(env["no_proxy"], "localhost,127.0.0.1,::1");
         assert!(env.keys().all(|key| PROXY_ENV_KEYS.contains(&key.as_str())));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_locate_runtime_on_linux_live() {
+        if Path::new("/usr/lib/chatgpt").is_dir() {
+            let runtime = locate_runtime().unwrap();
+            assert!(runtime.is_some(), "Linux 运行时应成功被检测到");
+            let r = runtime.unwrap();
+            assert_eq!(r.app_path, "/usr/lib/chatgpt");
+            assert!(Path::new(&r.node).is_file());
+            assert!(Path::new(&r.cua_repl).is_file());
+            assert!(Path::new(&r.node_repl).is_file());
+            assert!(Path::new(&r.node_module_dirs).is_dir());
+
+            let status_report = status().unwrap();
+            assert!(status_report.runtime_found);
+            assert_eq!(status_report.app_path.as_deref(), Some("/usr/lib/chatgpt"));
+            assert!(status_report.config_hint.is_none());
+        }
     }
 
     #[test]

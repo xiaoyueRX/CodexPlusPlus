@@ -447,8 +447,11 @@ pub fn resolve_codex_app_dir(app_dir: Option<&Path>) -> Option<PathBuf> {
     {
         return find_linux_codex_app_default();
     }
-    // Windows: try MS Store version first, then standalone install
-    find_latest_codex_app_dir_default().or_else(|| find_standalone_codex_app_dir())
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        // Windows: try MS Store version first, then standalone install
+        find_latest_codex_app_dir_default().or_else(|| find_standalone_codex_app_dir())
+    }
 }
 
 /// Search for standalone Codex installations (non-MS Store).

@@ -695,8 +695,9 @@ fn app_paths_linux_finds_codex_app_from_search_roots_avoiding_empty_opt() {
     // 模拟 /usr/lib/chatgpt/ChatGPT
     let usr_lib = temp.path().join("usr").join("lib");
     let chatgpt_dir = usr_lib.join("chatgpt");
-    std::fs::create_dir_all(&chatgpt_dir).unwrap();
+    std::fs::create_dir_all(chatgpt_dir.join("resources")).unwrap();
     std::fs::write(chatgpt_dir.join("ChatGPT"), "").unwrap();
+    std::fs::write(chatgpt_dir.join("resources").join("app.asar"), "electron").unwrap();
 
     let roots = vec![opt, usr_lib];
     assert_eq!(
