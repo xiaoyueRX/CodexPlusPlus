@@ -4,6 +4,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "linux")]
 pub mod linux;
 pub mod macos;
 pub mod windows;

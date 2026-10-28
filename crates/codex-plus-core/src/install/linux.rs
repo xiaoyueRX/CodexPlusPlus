@@ -1,4 +1,5 @@
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -35,6 +36,7 @@ pub fn install_shortcuts(options: &InstallOptions) -> anyhow::Result<()> {
     // 1. 安装到指定的 install_root（通常是 ~/Desktop）
     let desktop_shortcut = install_root.join(format!("{APP_NAME}.desktop"));
     fs::write(&desktop_shortcut, &content)?;
+    #[cfg(unix)]
     let _ = fs::set_permissions(&desktop_shortcut, fs::Permissions::from_mode(0o755));
 
     // 2. 同时确保 ~/.local/share/applications/ 下存在桌面入口，供应用菜单和 MIME handler 识别
@@ -43,6 +45,7 @@ pub fn install_shortcuts(options: &InstallOptions) -> anyhow::Result<()> {
         if fs::create_dir_all(&app_dir).is_ok() {
             let app_entry = app_dir.join("codex-plus-plus.desktop");
             let _ = fs::write(&app_entry, &content);
+            #[cfg(unix)]
             let _ = fs::set_permissions(&app_entry, fs::Permissions::from_mode(0o755));
 
             // 更新桌面数据库和 MIME 关联
