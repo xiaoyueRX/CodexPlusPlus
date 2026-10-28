@@ -1,13 +1,24 @@
 # Linux packaging and support
 
-## Supported Linux distribution
+## Supported Linux distributions
 
-The supported baseline for the amd64 Debian package is **Ubuntu 24.04 LTS**.
-Build and installation are checked with the `linux-deb` job on `ubuntu-24.04`.
-The package is not advertised as compatible with Ubuntu 22.04 or Debian 12:
-their runtime dependencies (including the Ubuntu 24.04 t64 transition) differ.
-The Linux graphical app still needs a working graphical desktop/session; WSL2
-requires WSLg or a comparable display server.
+The `.deb` package dependencies explicitly target the **64-bit `time_t` (`t64`) transition** packages:
+- `libglib2.0-0t64`
+- `libgtk-3-0t64`
+- `libssl3t64 (>= 3.0.0)`
+- `libatspi2.0-0t64`
+- `libasound2t64`
+
+### Verified & Tested Distributions:
+- **Ubuntu 24.04 LTS (Noble Numbat)**: Primary CI verification baseline (`ubuntu-24.04` runner).
+- **Debian 13 (Trixie)** / Debian Testing & Sid: Local development and live test baseline.
+- **Linux Mint 22**: Compatible derivative based on Ubuntu 24.04.
+
+### Incompatible Legacy Distributions:
+The package is **not compatible with Ubuntu 22.04 LTS (Jammy) or Debian 12 (Bookworm)**:
+their runtime repositories provide the legacy non-t64 package names (`libglib2.0-0`, `libgtk-3-0`, `libssl3`, etc.) and older glibc versions (< 2.34).
+
+The Linux graphical application requires an active desktop session (X11 or Wayland); WSL2 requires WSLg or an X11 display server.
 
 ## Build
 
@@ -37,9 +48,7 @@ ldd /usr/bin/codex-plus-plus
 ```
 
 The package contains exactly one executable, `/usr/bin/codex-plus-plus`.
-The Linux release job uploads `.deb` and `.tar.gz` independently of the
-Windows/macOS update metadata job. Linux packaging failure must not block
-`latest.json` for existing platforms.
+The PR build workflow verifies Linux release compilation and `.deb` package generation via the `linux-deb` job in `.github/workflows/pr-build.yml`.
 
-The CI build/installation check is not a substitute for a manual GUI launch
+The CI build and package installation check is not a substitute for a manual GUI launch
 test in a real desktop session.

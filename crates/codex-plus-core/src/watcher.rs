@@ -829,7 +829,7 @@ pub fn is_linux_codex_desktop_main(args: &str) -> bool {
         return false;
     }
     // 包内自带的 CLI 工具（非 Electron 桌面界面）
-    if args.contains("/resources/codex") {
+    if args.contains("/resources/codex") || args.contains("codex-cli") {
         return false;
     }
     // Codex++ 本身
@@ -842,10 +842,30 @@ pub fn is_linux_codex_desktop_main(args: &str) -> bool {
     let executable_end = args.find(" -").unwrap_or(args.len());
     let executable = args[..executable_end].trim_end();
     let executable_name = executable.rsplit('/').next().unwrap_or(executable);
-    matches!(
+    let is_candidate_name = matches!(
         executable_name,
         "ChatGPT" | "chatgpt" | "Codex" | "codex" | "ChatGPT Dev" | "Codex Dev"
-    )
+    );
+    if !is_candidate_name {
+        return false;
+    }
+
+    // 核心判据：必须为 Electron/桌面主进程或带有调试端口参数，
+    // 严禁将用户终端运行的纯命令行工具（如 `codex` / `codex -m ...`）误判为桌面版。
+    let has_debug_port =
+        args.contains("remote-debugging-port=") || args.contains("remote-debugging-pipe");
+    let has_electron_signatures = args.contains(".asar")
+        || args.contains("--enable-crashpad")
+        || args.contains("--ozone-platform")
+        || args.contains("--enable-features=");
+    let is_desktop_location = executable.starts_with("/opt/")
+        || executable.contains("/usr/lib/")
+        || executable.contains("/snap/")
+        || executable.starts_with("/app/")
+        || executable.contains(".AppImage")
+        || executable.contains(".appimage");
+
+    has_debug_port || has_electron_signatures || is_desktop_location
 }
 
 pub fn linux_desktop_main_processes_from_snapshot<'a>(
@@ -853,30 +873,38 @@ pub fn linux_desktop_main_processes_from_snapshot<'a>(
     uid: Option<u32>,
     debug_port: Option<u16>,
 ) -> Vec<LinuxDesktopProcess> {
+    let parsed = lines
+        .into_iter()
+        .filter_map(parse_macos_process_line)
+        .collect::<Vec<_>>();
+    let uid = uid.or_else(|| {
+        let own_process_id = std::process::id();
+        parsed
+            .iter()
+            .find(|process| process.pid == own_process_id)
+            .map(|process| process.uid)
+    });
     let debug_flag = debug_port.map(|port| format!("remote-debugging-port={port}"));
     let mut processes = Vec::new();
-    for line in lines {
-        let Some(parsed) = parse_macos_process_line(line) else {
-            continue;
-        };
+    for process in parsed {
         if let Some(uid) = uid {
-            if parsed.uid != uid {
+            if process.uid != uid {
                 continue;
             }
         }
-        if !is_linux_codex_desktop_main(&parsed.args) {
+        if !is_linux_codex_desktop_main(&process.args) {
             continue;
         }
         if let Some(flag) = &debug_flag {
-            if !parsed.args.contains(flag) {
+            if !process.args.contains(flag) {
                 continue;
             }
         }
-        let executable_end = parsed.args.find(" -").unwrap_or(parsed.args.len());
-        let executable = parsed.args[..executable_end].trim_end();
+        let executable_end = process.args.find(" -").unwrap_or(process.args.len());
+        let executable = process.args[..executable_end].trim_end();
         processes.push(LinuxDesktopProcess {
-            pid: parsed.pid,
-            lstart: parsed.lstart,
+            pid: process.pid,
+            lstart: process.lstart,
             executable: executable.to_string(),
         });
     }
