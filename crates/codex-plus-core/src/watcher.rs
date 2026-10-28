@@ -284,7 +284,6 @@ pub fn watcher_is_installed() -> bool {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
 pub fn linux_autostart_path() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|dirs| {
         dirs.config_dir().join("autostart").join("codex-plus-plus.desktop")
@@ -764,7 +763,6 @@ pub fn macos_desktop_main_processes_from_snapshot<'a>(
     processes
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
 struct MacosProcessLine {
     pid: u32,
     uid: u32,
@@ -772,7 +770,6 @@ struct MacosProcessLine {
     args: String,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn parse_macos_process_line(line: &str) -> Option<MacosProcessLine> {
     let trimmed = line.trim_start();
     let mut fields = trimmed.split_whitespace();
@@ -818,7 +815,6 @@ pub struct LinuxDesktopProcess {
     pub executable: String,
 }
 
-#[cfg(any(target_os = "linux", test))]
 pub fn is_linux_codex_desktop_main(args: &str) -> bool {
     let args = args.trim_start();
     if args.is_empty() {
@@ -852,7 +848,6 @@ pub fn is_linux_codex_desktop_main(args: &str) -> bool {
     )
 }
 
-#[cfg(any(target_os = "linux", test))]
 pub fn linux_desktop_main_processes_from_snapshot<'a>(
     lines: impl IntoIterator<Item = &'a str>,
     uid: Option<u32>,

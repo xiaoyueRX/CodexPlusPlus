@@ -254,7 +254,6 @@ fn linux_launcher_process_names_cover_development_and_packaged_binaries() {
     );
 }
 
-#[cfg(any(target_os = "linux", test))]
 #[test]
 fn linux_codex_desktop_main_distinguishes_main_and_child_processes() {
     use codex_plus_core::watcher::is_linux_codex_desktop_main;
@@ -276,7 +275,6 @@ fn linux_codex_desktop_main_distinguishes_main_and_child_processes() {
     assert!(!is_linux_codex_desktop_main("/usr/bin/codex-plus-plus --silent"));
 }
 
-#[cfg(any(target_os = "linux", test))]
 #[test]
 fn linux_desktop_main_processes_from_snapshot_filters_and_matches() {
     use codex_plus_core::watcher::linux_desktop_main_processes_from_snapshot;
