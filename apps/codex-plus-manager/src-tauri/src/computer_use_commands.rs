@@ -282,14 +282,61 @@ pub async fn computer_use_browser_extension_status() -> CommandResult<Value> {
         "hehggadaopoacecdllhhajmbjkdcmajg",
         "odlomjlbamekndcpllcnffbgeohgkmjh",
     ];
-    // native messaging host 文件：有它说明 Codex 已经注册过了。
-    let host_json = home
-        .join("Library/Application Support/Google/Chrome/NativeMessagingHosts")
-        .join("com.openai.codexextension.json");
-    let host_registered = host_json.is_file();
-    // Chrome 扩展目录：有任意一个 ID 目录就视为已安装。
-    let ext_base = home.join("Library/Application Support/Google/Chrome/Default/Extensions");
-    let ext_installed = EXT_IDS.iter().any(|id| ext_base.join(id).is_dir());
+    #[cfg(target_os = "macos")]
+    let host_json_candidates = vec![
+        home.join("Library/Application Support/Google/Chrome/NativeMessagingHosts/com.openai.codexextension.json"),
+        home.join("Library/Application Support/Chromium/NativeMessagingHosts/com.openai.codexextension.json"),
+    ];
+    #[cfg(target_os = "linux")]
+    let host_json_candidates = vec![
+        home.join(".config/google-chrome/NativeMessagingHosts/com.openai.codexextension.json"),
+        home.join(".config/chromium/NativeMessagingHosts/com.openai.codexextension.json"),
+        home.join(".config/microsoft-edge/NativeMessagingHosts/com.openai.codexextension.json"),
+        home.join(".config/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.openai.codexextension.json"),
+    ];
+    #[cfg(windows)]
+    let host_json_candidates = {
+        let mut candidates = Vec::new();
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            candidates.push(local.join("Google/Chrome/User Data/NativeMessagingHosts/com.openai.codexextension.json"));
+            candidates.push(local.join("Microsoft/Edge/User Data/NativeMessagingHosts/com.openai.codexextension.json"));
+        }
+        candidates
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    let host_json_candidates: Vec<PathBuf> = Vec::new();
+
+    let host_registered = host_json_candidates.iter().any(|path| path.is_file());
+
+    #[cfg(target_os = "macos")]
+    let ext_bases = vec![
+        home.join("Library/Application Support/Google/Chrome/Default/Extensions"),
+        home.join("Library/Application Support/Chromium/Default/Extensions"),
+    ];
+    #[cfg(target_os = "linux")]
+    let ext_bases = vec![
+        home.join(".config/google-chrome/Default/Extensions"),
+        home.join(".config/chromium/Default/Extensions"),
+        home.join(".config/microsoft-edge/Default/Extensions"),
+        home.join(".config/BraveSoftware/Brave-Browser/Default/Extensions"),
+    ];
+    #[cfg(windows)]
+    let ext_bases = {
+        let mut bases = Vec::new();
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let local = PathBuf::from(local);
+            bases.push(local.join("Google/Chrome/User Data/Default/Extensions"));
+            bases.push(local.join("Microsoft/Edge/User Data/Default/Extensions"));
+        }
+        bases
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    let ext_bases: Vec<PathBuf> = Vec::new();
+
+    let ext_installed = ext_bases.iter().any(|base| {
+        EXT_IDS.iter().any(|id| base.join(id).is_dir())
+    });
     let installed = host_registered || ext_installed;
     ok(
         if installed {
@@ -312,8 +359,14 @@ pub async fn computer_use_open_extension_store() -> CommandResult<Value> {
     let url = "https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg";
     #[cfg(windows)]
     let result = codex_plus_core::windows_open_url(url).map_err(|e| e.to_string());
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     let result = std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open")
         .arg(url)
         .spawn()
         .map(|_| ())
@@ -573,5 +626,27 @@ fn stop_preview() {
     let handle = PREVIEW.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(handle) = handle {
         handle.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_extension_status_detects_installed_host() {
+        let result = tauri::async_runtime::block_on(computer_use_browser_extension_status());
+        let payload = result.payload;
+        println!("Extension status: {:?}", payload);
+        assert!(payload.get("installed").is_some());
+        #[cfg(target_os = "linux")]
+        {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap();
+            let chrome_host = home.join(".config/google-chrome/NativeMessagingHosts/com.openai.codexextension.json");
+            if chrome_host.is_file() {
+                assert_eq!(payload.get("hostRegistered").and_then(|v| v.as_bool()), Some(true));
+                assert_eq!(payload.get("installed").and_then(|v| v.as_bool()), Some(true));
+            }
+        }
     }
 }

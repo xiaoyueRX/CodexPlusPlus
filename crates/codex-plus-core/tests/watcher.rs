@@ -247,6 +247,76 @@ fn macos_launcher_process_names_cover_development_and_packaged_binaries() {
 }
 
 #[test]
+fn linux_launcher_process_names_cover_development_and_packaged_binaries() {
+    assert_eq!(
+        codex_plus_core::watcher::linux_launcher_process_names(),
+        ["codex-plus-plus", "codex-plus-launcher", "codex-plus-manager"]
+    );
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[test]
+fn linux_codex_desktop_main_distinguishes_main_and_child_processes() {
+    use codex_plus_core::watcher::is_linux_codex_desktop_main;
+    // 主进程带调试端口
+    assert!(is_linux_codex_desktop_main("/usr/lib/chatgpt/ChatGPT --remote-debugging-port=9229 --remote-allow-origins=http://127.0.0.1:9229"));
+    // 便携/独立安装
+    assert!(is_linux_codex_desktop_main("/opt/chatgpt/ChatGPT"));
+    assert!(is_linux_codex_desktop_main("/usr/local/bin/codex"));
+    // Electron 子进程必须排除
+    assert!(!is_linux_codex_desktop_main("/usr/lib/chatgpt/ChatGPT --type=renderer --remote-debugging-port=9229"));
+    assert!(!is_linux_codex_desktop_main("/usr/lib/chatgpt/ChatGPT --type=zygote"));
+    assert!(!is_linux_codex_desktop_main("/usr/lib/chatgpt/ChatGPT --type=gpu-process"));
+    assert!(!is_linux_codex_desktop_main("/usr/lib/chatgpt/ChatGPT --type=utility"));
+    // 崩溃上报排除
+    assert!(!is_linux_codex_desktop_main("/usr/lib/chatgpt/browser_crashpad_handler"));
+    // 包内 CLI 排除
+    assert!(!is_linux_codex_desktop_main("/usr/lib/chatgpt/resources/codex app-server"));
+    // Codex++ 本身排除
+    assert!(!is_linux_codex_desktop_main("/usr/bin/codex-plus-plus --silent"));
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[test]
+fn linux_desktop_main_processes_from_snapshot_filters_and_matches() {
+    use codex_plus_core::watcher::linux_desktop_main_processes_from_snapshot;
+    let lines = [
+        "  100  1000 Wed Oct 28 14:47:44 2026 /usr/lib/chatgpt/ChatGPT --remote-debugging-port=9229",
+        "  101  1000 Wed Oct 28 14:47:44 2026 /usr/lib/chatgpt/ChatGPT --type=renderer",
+        "  102  1000 Wed Oct 28 14:47:44 2026 /usr/lib/chatgpt/ChatGPT --remote-debugging-port=9230",
+        "  103  1000 Wed Oct 28 14:47:44 2026 /usr/bin/codex-plus-plus",
+    ];
+
+    let all = linux_desktop_main_processes_from_snapshot(lines, None, None);
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].pid, 100);
+    assert_eq!(all[1].pid, 102);
+
+    let p9229 = linux_desktop_main_processes_from_snapshot(lines, None, Some(9229));
+    assert_eq!(p9229.len(), 1);
+    assert_eq!(p9229[0].pid, 100);
+
+    let p9230 = linux_desktop_main_processes_from_snapshot(lines, None, Some(9230));
+    assert_eq!(p9230.len(), 1);
+    assert_eq!(p9230[0].pid, 102);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_find_codex_processes_live_test() {
+    let pids = codex_plus_core::watcher::find_codex_processes();
+    println!("Live detected Codex PIDs: {pids:?}");
+    let p9229 = codex_plus_core::watcher::find_codex_processes_for_debug_port(9229);
+    println!("Live detected Codex 9229 PIDs: {p9229:?}");
+    assert!(pids.contains(&99100), "PID 99100 必须被认出是主桌面进程");
+    assert!(p9229.contains(&99100), "PID 99100 带有 9229 端口，必须被认出");
+
+    let probe = codex_plus_core::auto_takeover::probe_desktop_app(std::path::Path::new("/usr/lib/chatgpt"));
+    println!("Live probe_desktop_app(/usr/lib/chatgpt): {probe:?}");
+    assert!(matches!(probe, codex_plus_core::auto_takeover::AppProbe::Running(ref key) if key.pid == 99100));
+}
+
+#[test]
 fn stale_launcher_recovery_only_runs_when_codex_and_cdp_are_absent() {
     assert!(should_recover_stale_launcher(false, false));
     assert!(!should_recover_stale_launcher(true, false));

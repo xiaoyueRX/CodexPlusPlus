@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-#[cfg(any(windows, target_os = "macos"))]
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -275,10 +274,21 @@ pub fn watcher_is_installed() -> bool {
     {
         macos_launch_agent_path().is_some_and(|path| path.is_file())
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_autostart_path().is_some_and(|path| path.is_file())
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         false
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub fn linux_autostart_path() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|dirs| {
+        dirs.config_dir().join("autostart").join("codex-plus-plus.desktop")
+    })
 }
 
 pub fn cdp_listening(port: u16) -> bool {
@@ -376,6 +386,14 @@ pub fn macos_launcher_process_names() -> [&'static str; 2] {
     [
         crate::install::SILENT_BINARY,
         crate::install::MACOS_SILENT_EXECUTABLE,
+    ]
+}
+
+pub fn linux_launcher_process_names() -> [&'static str; 3] {
+    [
+        "codex-plus-plus",
+        "codex-plus-launcher",
+        "codex-plus-manager",
     ]
 }
 
@@ -746,7 +764,7 @@ pub fn macos_desktop_main_processes_from_snapshot<'a>(
     processes
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 struct MacosProcessLine {
     pid: u32,
     uid: u32,
@@ -754,7 +772,7 @@ struct MacosProcessLine {
     args: String,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn parse_macos_process_line(line: &str) -> Option<MacosProcessLine> {
     let trimmed = line.trim_start();
     let mut fields = trimmed.split_whitespace();
@@ -790,6 +808,103 @@ pub fn find_macos_codex_desktop_main_processes(
         None,
         debug_port,
         read_macos_bundle_identifier,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxDesktopProcess {
+    pub pid: u32,
+    pub lstart: String,
+    pub executable: String,
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub fn is_linux_codex_desktop_main(args: &str) -> bool {
+    let args = args.trim_start();
+    if args.is_empty() {
+        return false;
+    }
+    // Electron 子进程带 --type=
+    if args.contains(" --type=") || args.starts_with("--type=") {
+        return false;
+    }
+    // Crashpad 崩溃收集进程
+    if args.contains("crashpad_handler") {
+        return false;
+    }
+    // 包内自带的 CLI 工具（非 Electron 桌面界面）
+    if args.contains("/resources/codex") {
+        return false;
+    }
+    // Codex++ 本身
+    if args.contains("codex-plus-plus")
+        || args.contains("codex-plus-launcher")
+        || args.contains("codex-plus-manager")
+    {
+        return false;
+    }
+    let executable_end = args.find(" -").unwrap_or(args.len());
+    let executable = args[..executable_end].trim_end();
+    let executable_name = executable.rsplit('/').next().unwrap_or(executable);
+    matches!(
+        executable_name,
+        "ChatGPT" | "chatgpt" | "Codex" | "codex" | "ChatGPT Dev" | "Codex Dev"
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub fn linux_desktop_main_processes_from_snapshot<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    uid: Option<u32>,
+    debug_port: Option<u16>,
+) -> Vec<LinuxDesktopProcess> {
+    let debug_flag = debug_port.map(|port| format!("remote-debugging-port={port}"));
+    let mut processes = Vec::new();
+    for line in lines {
+        let Some(parsed) = parse_macos_process_line(line) else {
+            continue;
+        };
+        if let Some(uid) = uid {
+            if parsed.uid != uid {
+                continue;
+            }
+        }
+        if !is_linux_codex_desktop_main(&parsed.args) {
+            continue;
+        }
+        if let Some(flag) = &debug_flag {
+            if !parsed.args.contains(flag) {
+                continue;
+            }
+        }
+        let executable_end = parsed.args.find(" -").unwrap_or(parsed.args.len());
+        let executable = parsed.args[..executable_end].trim_end();
+        processes.push(LinuxDesktopProcess {
+            pid: parsed.pid,
+            lstart: parsed.lstart,
+            executable: executable.to_string(),
+        });
+    }
+    processes.sort_by_key(|p| p.pid);
+    processes.dedup_by_key(|p| p.pid);
+    processes
+}
+
+#[cfg(target_os = "linux")]
+pub fn find_linux_codex_desktop_main_processes(
+    debug_port: Option<u16>,
+) -> Vec<LinuxDesktopProcess> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,uid=,lstart=,args="])
+        .env("LC_ALL", "C")
+        .output()
+    else {
+        return Vec::new();
+    };
+    linux_desktop_main_processes_from_snapshot(
+        String::from_utf8_lossy(&output.stdout).lines(),
+        None,
+        debug_port,
     )
 }
 
@@ -961,9 +1076,37 @@ pub fn install_watcher(launcher_path: &Path, _debug_port: u16) -> anyhow::Result
     Ok(())
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub fn install_watcher(launcher_path: &Path, debug_port: u16) -> anyhow::Result<()> {
+    if !launcher_path.is_file() {
+        anyhow::bail!("找不到 Codex++ 可执行文件：{}", launcher_path.display());
+    }
+    let Some(desktop_path) = linux_autostart_path() else {
+        anyhow::bail!("无法定位当前用户配置目录");
+    };
+    if let Some(parent) = desktop_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let launcher_str = launcher_path.to_string_lossy();
+    let content = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Codex++\n\
+         Comment=Codex++ Launcher\n\
+         Exec=\"{launcher_str}\" --autostart\n\
+         Icon=codex-plus-plus\n\
+         Terminal=false\n\
+         Categories=Utility;\n\
+         X-GNOME-Autostart-enabled=true\n"
+    );
+    std::fs::write(&desktop_path, content)?;
+    spawn_launcher(launcher_path, debug_port);
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn install_watcher(_launcher_path: &Path, _debug_port: u16) -> anyhow::Result<()> {
-    anyhow::bail!("watcher install is only supported on Windows and macOS")
+    anyhow::bail!("watcher install is only supported on Windows, macOS, and Linux")
 }
 
 #[cfg(windows)]
@@ -986,7 +1129,17 @@ pub fn uninstall_watcher() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub fn uninstall_watcher() -> anyhow::Result<()> {
+    if let Some(desktop_path) = linux_autostart_path() {
+        if desktop_path.is_file() {
+            let _ = std::fs::remove_file(desktop_path);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn uninstall_watcher() -> anyhow::Result<()> {
     Ok(())
 }
@@ -1076,12 +1229,25 @@ pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
     find_codex_processes()
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub fn find_codex_processes() -> Vec<u32> {
+    find_linux_codex_desktop_main_processes(None)
+        .into_iter()
+        .map(|process| process.pid)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
+    find_codex_processes()
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn find_codex_processes() -> Vec<u32> {
     Vec::new()
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
     Vec::new()
 }
@@ -1111,7 +1277,14 @@ pub fn stop_launcher_processes() {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub fn stop_launcher_processes() {
+    for process_id in find_launcher_processes() {
+        let _ = terminate_linux_process(process_id);
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn stop_launcher_processes() {}
 
 #[cfg(windows)]
@@ -1476,7 +1649,17 @@ pub fn stop_launcher_processes_and_wait() {
     );
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub fn stop_launcher_processes_and_wait() {
+    terminate_linux_processes_and_wait(
+        find_launcher_processes(),
+        find_launcher_processes,
+        RESTART_STOP_WAIT_TIMEOUT_MS,
+        RESTART_STOP_WAIT_INTERVAL_MS,
+    );
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn stop_launcher_processes_and_wait() {}
 
 #[cfg(windows)]
@@ -1486,15 +1669,22 @@ pub fn stop_codex_processes() {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
-pub fn stop_codex_processes() {}
-
 #[cfg(target_os = "macos")]
 pub fn stop_codex_processes() {
     for process_id in find_codex_processes() {
         let _ = terminate_macos_process(process_id);
     }
 }
+
+#[cfg(target_os = "linux")]
+pub fn stop_codex_processes() {
+    for process_id in find_codex_processes() {
+        let _ = terminate_linux_process(process_id);
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+pub fn stop_codex_processes() {}
 
 #[cfg(windows)]
 pub fn stop_codex_processes_and_wait() {
@@ -1515,7 +1705,17 @@ pub fn stop_codex_processes_and_wait() {
     );
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub fn stop_codex_processes_and_wait() {
+    terminate_linux_processes_and_wait(
+        find_codex_processes(),
+        find_codex_processes,
+        RESTART_STOP_WAIT_TIMEOUT_MS,
+        RESTART_STOP_WAIT_INTERVAL_MS,
+    );
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn stop_codex_processes_and_wait() {}
 
 #[cfg(target_os = "macos")]
@@ -1529,7 +1729,15 @@ pub fn find_codex_processes_for_debug_port(debug_port: u16) -> Vec<u32> {
     codex_instance_processes_for_debug_port(debug_port)
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+pub fn find_codex_processes_for_debug_port(debug_port: u16) -> Vec<u32> {
+    find_linux_codex_desktop_main_processes(Some(debug_port))
+        .into_iter()
+        .map(|process| process.pid)
+        .collect()
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn find_codex_processes_for_debug_port(_debug_port: u16) -> Vec<u32> {
     find_codex_processes()
 }
@@ -1873,6 +2081,86 @@ fn find_launcher_processes() -> Vec<u32> {
     process_ids
 }
 
+#[cfg(target_os = "linux")]
+fn terminate_linux_process(process_id: u32) -> std::io::Result<()> {
+    Command::new("kill")
+        .arg("-15")
+        .arg(process_id.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|_| ())
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_linux_processes_and_wait<F>(
+    process_ids: Vec<u32>,
+    mut find_processes: F,
+    timeout_ms: u64,
+    interval_ms: u64,
+) where
+    F: FnMut() -> Vec<u32>,
+{
+    if process_ids.is_empty() {
+        return;
+    }
+    for process_id in &process_ids {
+        let _ = terminate_linux_process(*process_id);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let remaining = process_ids_still_running(&process_ids, find_processes());
+        if remaining.is_empty() || std::time::Instant::now() >= deadline {
+            if !remaining.is_empty() {
+                for process_id in &remaining {
+                    let _ = Command::new("kill")
+                        .arg("-9")
+                        .arg(process_id.to_string())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "watcher.stop_wait_timeout",
+                    serde_json::json!({
+                        "remaining_process_ids": remaining,
+                        "timeout_ms": timeout_ms,
+                        "platform": "linux"
+                    }),
+                );
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn find_launcher_processes() -> Vec<u32> {
+    let current_process_id = std::process::id();
+    let mut process_ids = linux_launcher_process_names()
+        .into_iter()
+        .flat_map(|process_name| {
+            std::process::Command::new("pgrep")
+                .args(["-x", process_name])
+                .output()
+                .ok()
+                .into_iter()
+                .flat_map(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .filter_map(|value| value.trim().parse::<u32>().ok())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|process_id| *process_id != current_process_id)
+        .collect::<Vec<_>>();
+    process_ids.sort_unstable();
+    process_ids.dedup();
+    process_ids
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn find_macos_codex_processes_for_debug_port(debug_port: u16) -> Vec<u32> {
     let Ok(output) = std::process::Command::new("ps")
@@ -2062,6 +2350,19 @@ fn spawn_launcher(launcher_path: &Path, debug_port: u16) {
         use std::os::windows::process::CommandExt;
         command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
         let _ = command.spawn();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_launcher(launcher_path: &Path, debug_port: u16) {
+    let command = build_spawn_launcher_command(&launcher_path.to_string_lossy(), debug_port);
+    if let Some((exe, args)) = command.split_first() {
+        let _ = Command::new(exe)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
     }
 }
 
