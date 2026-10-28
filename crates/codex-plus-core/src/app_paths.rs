@@ -440,12 +440,13 @@ pub fn resolve_codex_app_dir(app_dir: Option<&Path>) -> Option<PathBuf> {
     if let Some(app_dir) = app_dir {
         return normalize_codex_app_path(app_dir);
     }
-    if cfg!(target_os = "macos") {
-        return find_macos_codex_app_default();
+    #[cfg(target_os = "macos")]
+    {
+        find_macos_codex_app_default()
     }
     #[cfg(target_os = "linux")]
     {
-        return find_linux_codex_app_default();
+        find_linux_codex_app_default()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
