@@ -1,19 +1,18 @@
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const VOLCENGINE_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-volcengine.png");
 const PACKYCODE_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-packycode.png");
 const TOKEN_BRIDGE_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-0029.svg");
 const APIKEY_FUN_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-apikey-fun.png");
 const RAWCHAT_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-rawchat.svg");
 const RUNAPI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-runapi.png");
 const BAIKEWEI_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-baikewei-ai.jpg");
-const DEEPKEY_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-deepkey.png");
 const APIMART_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-apimart.png");
 const FENNO_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-fenno-ai.png");
 const QINIU_AI_IMAGE: &[u8] = include_bytes!("../../../docs/images/sponsor-qiniu-ai.png");
 
-pub const DEFAULT_AD_LIST_URLS: [&str; 2] = [
+pub const DEFAULT_AD_LIST_URLS: [&str; 3] = [
+    "https://ads.codexpp.cc/ads.json",
     "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
     "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
 ];
@@ -33,22 +32,46 @@ pub fn normalize_ad_payload(payload: Value) -> Value {
             matches!(ad_type, Some("sponsor" | "normal"))
                 && title.is_some_and(|value| !value.trim().is_empty())
                 && description.is_some_and(|value| !value.trim().is_empty())
-                && url.is_some_and(|value| !value.trim().is_empty())
+                && url.is_some_and(is_web_url)
         })
         .cloned()
         .collect::<Vec<_>>();
     fill_known_remote_logos(&mut ads);
     // `topAd` 是独立的置顶赞助位，**不参与** `ads` 列表的排序与过期过滤语义。
-    // 它比普通推荐贵，由商务单独指定，所以不能混在推荐池里按数组顺序取。
-    let top_ad = payload
+    // 同时兼容单条对象和多条数组，数组用于管理工具的横幅轮播。
+    let raw_top_ads = payload
         .get("top_ad")
-        .or_else(|| payload.get("topAd"))
-        .filter(|value| is_usable_ad(value))
-        .cloned();
-    match top_ad {
-        Some(top_ad) => json!({ "version": version, "ads": ads, "topAd": top_ad }),
-        None => json!({ "version": version, "ads": ads }),
+        .or_else(|| payload.get("topAd"));
+    let mut top_ads = match raw_top_ads {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter(|ad| is_usable_ad(ad))
+            .cloned()
+            .collect::<Vec<_>>(),
+        Some(value) if is_usable_ad(value) => vec![value.clone()],
+        _ => Vec::new(),
+    };
+    fill_known_remote_logos(&mut top_ads);
+
+    let mut normalized = json!({ "version": version, "ads": ads });
+    if !top_ads.is_empty() {
+        normalized["topAd"] = top_ads[0].clone();
+        normalized["topAds"] = json!(top_ads);
     }
+    normalized
+}
+
+/// 广告落地页只接受 http(s) 外链。
+///
+/// 广告清单是远程内容，`javascript:` / `data:` / `file:` 一旦漏进 `<a href>`，
+/// 点击就会在 Codex 渲染进程里执行脚本。管理端打开链接的入口已经只认
+/// http(s)，这里在归一层再挡一次，保证注入端拿到的数据本身就是干净的。
+fn is_web_url(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    let rest = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"));
+    rest.is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
 }
 
 /// 一条广告是否可用（类型、标题、描述、URL 齐全）。
@@ -62,7 +85,7 @@ fn is_usable_ad(ad: &Value) -> bool {
     matches!(ad_type, Some("sponsor" | "normal"))
         && field("title")
         && field("description")
-        && field("url")
+        && ad.get("url").and_then(Value::as_str).is_some_and(is_web_url)
 }
 
 fn fill_known_remote_logos(ads: &mut [Value]) {
@@ -89,14 +112,12 @@ fn fill_known_remote_logos(ads: &mut [Value]) {
 
 fn known_remote_logo(id: &str) -> Option<(&'static str, &'static [u8])> {
     match id {
-        "volcengine-ark-agent-plan" => Some(("image/png", VOLCENGINE_IMAGE)),
         "0029-token-bridge" => Some(("image/png", PACKYCODE_IMAGE)),
         "0055-token-bridge" => Some(("image/svg+xml", TOKEN_BRIDGE_IMAGE)),
         "apikey-fun-ai-relay" => Some(("image/png", APIKEY_FUN_IMAGE)),
         "rawchat-codex-relay" => Some(("image/svg+xml", RAWCHAT_IMAGE)),
         "runapi-openrouter-alternative" => Some(("image/png", RUNAPI_IMAGE)),
         "baikewei-ai" => Some(("image/jpeg", BAIKEWEI_AI_IMAGE)),
-        "deepkey-api-key" => Some(("image/png", DEEPKEY_IMAGE)),
         "apimart" => Some(("image/png", APIMART_IMAGE)),
         "fenno-ai" => Some(("image/png", FENNO_AI_IMAGE)),
         "qiniu-ai" => Some(("image/png", QINIU_AI_IMAGE)),
@@ -205,6 +226,23 @@ mod tests {
             "topAd": sponsored("premium"),
         }));
         assert_eq!(camel["topAd"]["id"], json!("premium"));
+    }
+
+    #[test]
+    fn top_ad_accepts_multiple_usable_ads_for_rotation() {
+        let normalized = normalize_ad_payload(json!({
+            "version": 1,
+            "ads": [],
+            "top_ad": [
+                sponsored("premium-a"),
+                { "type": "sponsor", "title": "残缺", "description": "描述" },
+                sponsored("premium-b"),
+            ],
+        }));
+
+        assert_eq!(normalized["topAd"]["id"], json!("premium-a"));
+        assert_eq!(normalized["topAds"].as_array().unwrap().len(), 2);
+        assert_eq!(normalized["topAds"][1]["id"], json!("premium-b"));
     }
 
     #[test]

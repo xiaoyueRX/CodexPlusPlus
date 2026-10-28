@@ -8,7 +8,9 @@ DIST="$ROOT/dist/macos"
 STAGE="$DIST/stage"
 BINARY_DIR="${BINARY_DIR:-$ROOT/target/release}"
 DMG="$DIST/CodexPlusPlus-${VERSION}-macos-${ARCH}.dmg"
-ICON_SOURCE="$ROOT/apps/codex-plus-manager/src-tauri/icons/icon.png"
+# macOS 用带圆角方形底的版本：macOS 26 会把不是标准圆角方形的图标放进一块灰色底板。没有时退回通用图标。
+ICON_SOURCE="$ROOT/apps/codex-plus-manager/src-tauri/icons/icon-macos.png"
+[ -f "$ICON_SOURCE" ] || ICON_SOURCE="$ROOT/apps/codex-plus-manager/src-tauri/icons/icon.png"
 ICON_NAME="codex-plus-plus.icns"
 ICON_ICNS="$DIST/$ICON_NAME"
 BACKGROUND_SOURCE="$ROOT/assets/installer/macos/dmg-background.svg"
@@ -75,7 +77,7 @@ create_app() {
   cp "$ICON_ICNS" "$app_dir/Contents/Resources/$ICON_NAME"
   chmod +x "$app_dir/Contents/MacOS/$executable_name"
   printf 'APPL????' > "$app_dir/Contents/PkgInfo"
-  if [ "$executable_name" = "CodexPlusPlusManager" ]; then
+  if [ "$executable_name" = "CodexPlusPlus" ]; then
     url_types='  <key>CFBundleURLTypes</key>
   <array>
     <dict>
@@ -108,6 +110,8 @@ create_app() {
   <string>6.0</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CodexPlusUnifiedApp</key>
+  <true/>
   <key>CFBundleSignature</key>
   <string>????</string>
   <key>CFBundleExecutable</key>
@@ -126,12 +130,77 @@ $url_types
 PLIST
 }
 
+# 签名身份。设了 MACOS_SIGNING_IDENTITY 就走 Developer ID 正式签名，
+# 没设则退回 ad-hoc——贡献者本地和 PR 构建没有证书，不能因此构建失败。
+SIGNING_IDENTITY="${MACOS_SIGNING_IDENTITY:-}"
+# 公证凭据 profile（notarytool store-credentials 存的那个名字）。
+# 设为空则跳过公证，只签名。
+NOTARY_PROFILE="${MACOS_NOTARY_PROFILE:-}"
+# 正式（Developer ID + hardened runtime）签名用的 entitlements（文件存在时才带）。
+# 注意：plist 里不要写 XML 注释——AMFI 解析器很严格，注释里出现 "--" 就会报
+# "AMFIUnserializeXML: syntax error"，说明一律写在这里。
+ENTITLEMENTS="$ROOT/scripts/installer/macos/entitlements.plist"
+
+# 签名参数必须用数组装：身份串里含空格
+# （"Developer ID Application: Xxx (TEAMID)"），用字符串拼接会在空格处断词。
+SIGN_ARGS=()
+if [ -n "$SIGNING_IDENTITY" ]; then
+  # hardened runtime 与安全时间戳是公证的前置条件，ad-hoc 下无意义。
+  SIGN_ARGS=(--options runtime --timestamp --sign "$SIGNING_IDENTITY")
+else
+  SIGN_ARGS=(--sign -)
+fi
+
 sign_app() {
   local app_dir="$1"
   local executable
   executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_dir/Contents/Info.plist")"
-  codesign --force --sign - "$app_dir/Contents/MacOS/$executable"
-  codesign --force --sign - "$app_dir"
+  # 二进制先签、bundle 后签：签 bundle 时会把二进制纳入密封清单，
+  # 顺序反了会报 "code object is not signed at all"。
+  # 注意：macOS 自带 bash 3.2，set -u 下展开空数组会报 unbound variable，
+  # 所以空数组必须用 "${arr[@]+"${arr[@]}"}" 这种形式，不能直接 "${arr[@]}"。
+  local extra=()
+  if [ -n "$SIGNING_IDENTITY" ] && [ -f "$ENTITLEMENTS" ]; then
+    extra=(--entitlements "$ENTITLEMENTS")
+  fi
+  codesign --force "${SIGN_ARGS[@]}" ${extra[@]+"${extra[@]}"} "$app_dir/Contents/MacOS/$executable"
+  # bundle 签名会重签主可执行文件，这里不带 entitlements 会把上一步的冲掉。
+  codesign --force "${SIGN_ARGS[@]}" ${extra[@]+"${extra[@]}"} "$app_dir"
+}
+
+sign_dmg() {
+  local dmg="$1"
+  if [ -z "$SIGNING_IDENTITY" ]; then
+    return 0
+  fi
+  codesign --force --timestamp --sign "$SIGNING_IDENTITY" "$dmg"
+}
+
+notarize_dmg() {
+  local dmg="$1"
+  if [ -z "$SIGNING_IDENTITY" ] || [ -z "$NOTARY_PROFILE" ]; then
+    echo "note: 跳过公证（未同时提供 MACOS_SIGNING_IDENTITY 与 MACOS_NOTARY_PROFILE）" >&2
+    return 0
+  fi
+
+  echo "==> 提交公证，等待 Apple 扫描结果…" >&2
+  # --wait 会阻塞到 Apple 返回结果；失败时只给 submission id，日志要另外取。
+  # 输出必须先收进变量再 grep：直接管道给 grep -q 时，grep 一命中就退出，
+  # 上游 tee 收到 SIGPIPE，在 set -o pipefail 下会把整条管道判为失败。
+  local output
+  output="$(xcrun notarytool submit "$dmg" --keychain-profile "$NOTARY_PROFILE" --wait 2>&1)" || true
+  printf '%s\n' "$output" >&2
+  if ! printf '%s\n' "$output" | grep -q "status: Accepted"; then
+    echo "error: 公证未通过。" >&2
+    echo "       用 'xcrun notarytool log <submission-id> --keychain-profile $NOTARY_PROFILE' 看详情，" >&2
+    echo "       最常见原因是签名漏了 --options runtime。" >&2
+    return 1
+  fi
+
+  # 装订票据后，用户离线也能通过 Gatekeeper 校验。
+  xcrun stapler staple "$dmg" >/dev/null
+  xcrun stapler validate "$dmg" >/dev/null
+  echo "==> 公证通过，票据已装订" >&2
 }
 
 verify_app() {
@@ -148,22 +217,37 @@ verify_app() {
     echo "error: missing PkgInfo in $app_dir" >&2
     return 1
   fi
-  codesign -dv "$app_dir" >/dev/null 2>&1 || {
-    echo "error: codesign verification failed for $app_dir" >&2
-    return 1
-  }
+  # 正式签名时用 --verify --deep --strict 真正校验签名有效性（含资源密封、
+  # 信任链、时间戳）；仅 codesign -dv 只能证明"有签名"，证明不了"签名有效"。
+  if [ -n "$SIGNING_IDENTITY" ]; then
+    codesign --verify --deep --strict --verbose=2 "$app_dir" || {
+      echo "error: codesign --verify failed for $app_dir" >&2
+      return 1
+    }
+  else
+    codesign -dv "$app_dir" >/dev/null 2>&1 || {
+      echo "error: codesign verification failed for $app_dir" >&2
+      return 1
+    }
+  fi
 }
 
 prepare_icon
 prepare_background
-create_app "Codex++" "CodexPlusPlus" "$BINARY_DIR/codex-plus-plus" "com.bigpizzav3.codexplusplus" "true"
-create_app "Codex++ 管理工具" "CodexPlusPlusManager" "$BINARY_DIR/codex-plus-plus-manager" "com.bigpizzav3.codexplusplus.manager" "false"
+create_app "Codex++" "CodexPlusPlus" "$BINARY_DIR/codex-plus-plus" "com.bigpizzav3.codexplusplus" "false"
+# 旧版 1.7.x 更新器要求第二个 manager bundle。它使用独立的小型兼容壳，
+# 启动后立即退出；新版启动主 app 后会把这个壳归档到 legacy-migrations。
+create_app "Codex++ 管理工具" "CodexPlusPlusManager" "$BINARY_DIR/codex-plus-legacy-shim" "com.bigpizzav3.codexplusplus.manager" "true"
 
 sign_app "$STAGE/Codex++.app"
 sign_app "$STAGE/Codex++ 管理工具.app"
 
 verify_app "$STAGE/Codex++.app"
 verify_app "$STAGE/Codex++ 管理工具.app"
+
+# Finder 隐藏兼容壳；旧更新器按精确路径读取它，不能改名或放入子目录。
+printf '%s\n' "Codex++ 管理工具.app" > "$STAGE/.hidden"
+chflags hidden "$STAGE/Codex++ 管理工具.app"
 
 ln -s /Applications "$STAGE/Applications"
 
@@ -296,8 +380,8 @@ with timeout of 30 seconds
 
     tell dmgDisk
       set position of item "Applications" to {1000, 390}
-      set position of item "Codex++.app" to {220, 390}
-      set position of item "Codex++ 管理工具.app" to {460, 390}
+      set position of item "Codex++.app" to {460, 390}
+      set visible of item "Codex++ 管理工具.app" to false
     end tell
 
     close dmgWindow
@@ -347,5 +431,10 @@ if [ ! -s "$DMG" ]; then
   find "$DIST" -maxdepth 2 -type f -print >&2 || true
   exit 1
 fi
+
+# 顺序不能变：先签 app（已在上面完成）→ 打 DMG → 签 DMG → 公证 DMG → 装订票据。
+# DMG 本身也要签名，Apple 才知道这个容器是谁做的。
+sign_dmg "$DMG"
+notarize_dmg "$DMG"
 
 echo "$DMG"

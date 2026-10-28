@@ -1,19 +1,21 @@
 use codex_plus_core::protocol_proxy::{
-    ChatSseToResponsesConverter, CompactionSseConverter, audio_transcriptions_url,
-    chat_completion_to_response, chat_completion_to_response_with_request, chat_completions_url,
-    chat_sse_to_responses_sse, chat_sse_to_responses_sse_with_request, image_edits_url,
-    image_generations_url, is_audio_transcriptions_proxy_path, is_chat_completions_proxy_path,
-    is_image_edits_proxy_path, is_image_generations_proxy_path, is_models_proxy_path,
-    is_responses_compact_proxy_path, is_responses_proxy_path, models_url,
-    open_audio_transcriptions_proxy_request, open_chat_completions_proxy_request,
-    open_image_edits_proxy_request, open_image_generations_proxy_request,
-    open_models_proxy_request, open_responses_proxy_request,
+    ChatSseToResponsesConverter, CompactionSseConverter, ProxySessionHeaders,
+    audio_transcriptions_url, chat_completion_to_response,
+    chat_completion_to_response_with_request, chat_completions_url, chat_sse_to_responses_sse,
+    chat_sse_to_responses_sse_with_request, ensure_web_search_tool_for_history,
+    image_edits_url, image_generations_url,
+    is_audio_transcriptions_proxy_path, is_chat_completions_proxy_path, is_image_edits_proxy_path,
+    is_image_generations_proxy_path, is_models_proxy_path, is_responses_compact_proxy_path,
+    is_responses_proxy_path, models_url, open_audio_transcriptions_proxy_request,
+    open_chat_completions_proxy_request, open_image_edits_proxy_request,
+    open_image_generations_proxy_request, open_models_proxy_request, open_responses_proxy_request,
     open_responses_proxy_request_with_settings,
-    open_responses_proxy_request_with_settings_for_path, request_has_compaction_trigger,
-    responses_compact_url, responses_error_from_upstream, responses_to_chat_completions,
-    responses_to_chat_completions_with_options, send_upstream_request_with_header_timeout,
-    upstream_header_timeout, upstream_http_client, upstream_stream_header_timeout,
-    wrap_non_stream_response_as_compaction,
+    open_responses_proxy_request_with_settings_for_path,
+    open_responses_proxy_request_with_settings_for_path_and_session_headers,
+    request_has_compaction_trigger, responses_compact_url, responses_error_from_upstream,
+    responses_to_chat_completions, responses_to_chat_completions_with_options,
+    send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
+    upstream_stream_header_timeout, wrap_non_stream_response_as_compaction,
 };
 use codex_plus_core::relay_config::test_relay_profile;
 use codex_plus_core::settings::{
@@ -68,13 +70,297 @@ fn compaction_trigger_detection() {
 }
 
 #[test]
+fn web_search_history_restores_declaration_without_changing_history_or_function_tools() {
+    let mut request = json!({
+        "input": [{"type": "web_search_call", "id": "ws_test", "status": "completed",
+            "action": {"type": "search", "query": "example"}}],
+        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+        "tool_choice": "auto"
+    });
+    let original = request.clone();
+    assert!(ensure_web_search_tool_for_history(&mut request));
+    assert_eq!(request["input"], original["input"]);
+    assert_eq!(request["tools"][0], original["tools"][0]);
+    assert_eq!(request["tool_choice"], original["tool_choice"]);
+    assert_eq!(
+        request["tools"][1],
+        json!({"type": "web_search", "external_web_access": false})
+    );
+    let repaired = request.clone();
+    assert!(!ensure_web_search_tool_for_history(&mut request));
+    assert_eq!(request, repaired, "repair must be idempotent");
+}
+
+#[test]
+fn web_search_history_keeps_existing_declarations_including_additional_tools() {
+    for declaration in [
+        "web_search",
+        "web_search_preview",
+        "web_search_preview_2025_03_11",
+    ] {
+        for additional in [false, true] {
+            let tools = json!([{"type": declaration, "search_context_size": "low"}]);
+            let mut request = json!({
+                "input": [{"type": "web_search_call", "id": "ws_test"}],
+                "tools": if additional { json!([]) } else { tools.clone() }
+            });
+            if additional {
+                request["input"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type": "additional_tools", "role": "developer", "tools": tools}));
+            }
+            let original = request.clone();
+            assert!(!ensure_web_search_tool_for_history(&mut request));
+            assert_eq!(request, original);
+        }
+    }
+}
+
+#[test]
+fn web_search_history_preserves_no_tool_semantics_and_explicit_tool_choices() {
+    for tools in [None, Some(Value::Null), Some(json!([]))] {
+        for choice in [
+            None,
+            Some(Value::Null),
+            Some(json!("auto")),
+            Some(json!("none")),
+            Some(json!("required")),
+            Some(json!({"type": "function", "name": "lookup"})),
+        ] {
+            let mut request = json!({"input": [{"type": "web_search_call"}]});
+            if let Some(tools) = &tools {
+                request["tools"] = tools.clone();
+            }
+            if let Some(choice) = &choice {
+                request["tool_choice"] = choice.clone();
+            }
+            assert!(ensure_web_search_tool_for_history(&mut request));
+            let expected = match choice {
+                None | Some(Value::Null) => json!("none"),
+                Some(Value::String(ref value)) if value == "auto" || value == "none" => {
+                    json!("none")
+                }
+                Some(value) => value,
+            };
+            assert_eq!(request["tool_choice"], expected);
+            assert_eq!(
+                request["tools"],
+                json!([{"type": "web_search", "external_web_access": false}])
+            );
+        }
+    }
+    let mut request = json!({
+        "input": [{"type": "web_search_call"},
+            {"type": "additional_tools", "tools": [{"type": "function", "name": "lookup"}]}]
+    });
+    assert!(ensure_web_search_tool_for_history(&mut request));
+    assert!(
+        request.get("tool_choice").is_none(),
+        "existing additional tools remain callable"
+    );
+}
+
+#[test]
+fn web_search_history_leaves_unrelated_and_malformed_requests_unchanged() {
+    for mut request in [
+        json!({"input": "hello"}),
+        json!({"input": [{"type": "message", "role": "user", "content": "hello"}]}),
+        json!({"input": [{"type": "web_search_call"}], "tools": {}}),
+        json!({"input": [{"type": "web_search_call"}], "tools": "invalid"}),
+        json!({"input": [null, 7, "web_search_call", {"content": "web_search_call"}]}),
+    ] {
+        let original = request.clone();
+        assert!(!ensure_web_search_tool_for_history(&mut request));
+        assert_eq!(request, original);
+    }
+}
+
+#[tokio::test]
+async fn web_search_history_proxy_declares_only_for_standard_responses() {
+    for (protocol, path, trigger, enabled, repair) in [
+        (RelayProtocol::Responses, "/v1/responses", false, true, true),
+        (RelayProtocol::Responses, "/v1/responses", false, false, false),
+        (RelayProtocol::Responses, "/v1/responses", true, true, true),
+        (RelayProtocol::Responses, "/v1/responses/compact", false, true, false),
+        (RelayProtocol::ChatCompletions, "/v1/responses", false, true, false),
+    ] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let response_body = if trigger || is_responses_compact_proxy_path(path) {
+            json!({
+                "id": "resp_native_compaction",
+                "object": "response",
+                "output": [{"type": "compaction", "id": "cmp_test", "encrypted_content": "opaque"}]
+            })
+        } else {
+            json!({"id": "resp_model_route", "object": "response"})
+        };
+        let server = tokio::spawn(capture_request_with_response(
+            listener,
+            "application/json",
+            response_body.to_string(),
+        ));
+        let mut settings = model_route_settings("gpt-5.6-luna", "", format!("http://{address}/v1"));
+        settings.relay_profiles[1].protocol = protocol;
+        settings.relay_profiles[1].relay_mode = RelayMode::PureApi;
+        settings.relay_profiles[1].web_search_history_compat = enabled;
+        settings.relay_profiles[0].web_search_history_compat = !enabled;
+        if protocol == RelayProtocol::ChatCompletions {
+            // Model routing intentionally accepts only Responses targets.
+            settings.relay_profiles[0].model_routes.clear();
+            settings.active_relay_id = settings.relay_profiles[1].id.clone();
+        }
+        let mut request = json!({
+            "model": "gpt-5.6-luna",
+            "stream": false,
+            "tools": [],
+            "input": [
+                {"type": "message", "role": "user", "content": "summarize"},
+                {"type": "web_search_call", "id": "ws_test", "status": "completed"}
+            ]
+        });
+        if trigger {
+            request["input"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type": "compaction_trigger", "future": "preserve"}));
+        }
+        let result = open_responses_proxy_request_with_settings_for_path(
+            &request.to_string(),
+            settings,
+            path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status_code, 200);
+        let (headers, sent) = server.await.unwrap();
+        if repair {
+            let mut expected = request;
+            expected["tools"] = json!([{"type": "web_search", "external_web_access": false}]);
+            expected["tool_choice"] = json!("none");
+            assert_eq!(sent, expected, "history and native compaction must survive");
+            assert!(headers.starts_with("POST /v1/responses HTTP/1.1"));
+            assert!(!result.compaction);
+        } else if protocol == RelayProtocol::Responses {
+            assert_eq!(
+                sent, request,
+                "disabled providers and legacy compact remain unchanged"
+            );
+            assert!(headers.starts_with(&format!("POST {path} HTTP/1.1")));
+        } else {
+            let expected = responses_to_chat_completions_with_options(request, false).unwrap();
+            assert_eq!(sent, expected, "Chat conversion must remain unchanged");
+            assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn web_search_history_streaming_compaction_preserves_native_state() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let item = json!({"type": "compaction", "id": "cmp_test", "encrypted_content": "opaque"});
+    let response = format!(
+        "data: {}\n\ndata: {}\n\n",
+        json!({"type": "response.output_item.done", "output_index": 0, "item": item}),
+        json!({"type": "response.completed", "response": {"id": "resp_test", "output": [item]}})
+    );
+    let server = tokio::spawn(capture_request_with_response(
+        listener,
+        "text/event-stream",
+        response.clone(),
+    ));
+    let request = json!({
+        "model": "gpt-5.6-luna", "stream": true, "store": false,
+        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+        "tool_choice": "auto",
+        "input": [
+            {"type": "compaction", "id": "cmp_prior", "encrypted_content": "prior-state"},
+            {"type": "web_search_call", "id": "ws_test", "status": "completed",
+                "action": {"type": "search", "query": "example"}},
+            {"type": "compaction_trigger", "future": "preserve"}
+        ]
+    });
+    let mut settings = model_route_settings("gpt-5.6-luna", "", format!("http://{address}/v1"));
+    settings.relay_profiles[1].web_search_history_compat = true;
+    settings.relay_profiles[1].relay_mode = RelayMode::PureApi;
+    let mut result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert!(!result.compaction);
+    assert_eq!(result.read_body().await.unwrap(), response.as_bytes().to_vec());
+    let (_, sent) = server.await.unwrap();
+    let mut expected = request;
+    expected["tools"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type": "web_search", "external_web_access": false}));
+    assert_eq!(sent, expected);
+}
+
+#[tokio::test]
+async fn web_search_history_uses_each_fallback_providers_own_opt_in() {
+    for enabled in [false, true] {
+        let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let second = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let mut settings = aggregate_proxy_settings(
+            if enabled {
+                "web-history-on"
+            } else {
+                "web-history-off"
+            },
+            format!("http://{}/v1", first.local_addr().unwrap()),
+            format!("http://{}/v1", second.local_addr().unwrap()),
+        );
+        settings.relay_profiles[0].web_search_history_compat = !enabled;
+        settings.relay_profiles[1].web_search_history_compat = enabled;
+        settings.relay_profiles[0].relay_mode = RelayMode::PureApi;
+        settings.relay_profiles[1].relay_mode = RelayMode::PureApi;
+        let first_server = tokio::spawn(respond_once(
+            first,
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n",
+        ));
+        let second_server = tokio::spawn(capture_json_request_once(second));
+        let request = json!({
+            "model": "gpt-5.6-luna", "stream": false,
+            "input": [{"type": "web_search_call", "id": "ws_test"}],
+            "tools": []
+        });
+        let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+            .await
+            .unwrap();
+        assert_eq!(result.status_code, 200);
+        first_server.await.unwrap();
+        let (_, sent) = second_server.await.unwrap();
+        let mut expected = request;
+        if enabled {
+            expected["tools"] = json!([{"type": "web_search", "external_web_access": false}]);
+            expected["tool_choice"] = json!("none");
+        }
+        assert_eq!(
+            sent, expected,
+            "the first provider must not contaminate fallback requests"
+        );
+    }
+}
+
+#[test]
 fn compaction_history_item_expands_to_user_message_in_chat_conversion() {
     let converted = responses_to_chat_completions(json!({
         "model": "deepseek-v4-flash",
         "input": [
             { "type": "message", "role": "user",
               "content": [{ "type": "input_text", "text": "latest question" }] },
-            { "type": "compaction", "encrypted_content": "PRIOR_SUMMARY" }
+            local_compaction_item("PRIOR_SUMMARY")
         ]
     }))
     .unwrap();
@@ -92,9 +378,220 @@ fn compaction_history_item_expands_to_user_message_in_chat_conversion() {
 }
 
 #[test]
+fn chat_conversion_forwards_plaintext_encrypted_agent_content_in_order() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-flash",
+        "input": [
+            { "type": "agent_message", "id": "amsg_real_shape",
+              "author": "/root/orchestrator", "recipient": "/root/worker",
+              "content": [
+                  { "type": "input_text",
+                    "text": "Message Type: NEW_TASK Task name: /root/worker Payload:" },
+                  { "type": "encrypted_content",
+                    "encrypted_content": "收到任务：请核对改动并把结论整理成三段发回。" }
+              ] }
+        ]
+    }))
+    .unwrap();
+
+    let messages = converted["messages"].as_array().unwrap();
+    let forwarded = messages
+        .iter()
+        .find(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("收到任务"))
+        })
+        .expect("agent_message 内的明文 encrypted_content 片段应透传为文本");
+    assert_eq!(forwarded["role"], "user");
+    let content = forwarded["content"].as_str().unwrap();
+    let header_pos = content.find("Payload:").expect("头部文本应保留");
+    let payload_pos = content.find("收到任务").unwrap();
+    assert!(
+        payload_pos > header_pos,
+        "片段顺序必须保持 header 在前、payload 在后"
+    );
+}
+
+#[test]
+fn chat_conversion_rejects_plaintext_encrypted_content_outside_agent_message() {
+    let error = responses_to_chat_completions(json!({
+        "model": "custom-model",
+        "input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "Payload:"},
+            {"type": "encrypted_content", "text": "private-agent-payload"}
+        ]}]
+    }))
+    .expect_err("普通 message 里的 encrypted_content 必须 fail closed");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+    assert!(!diagnostic.contains("private-agent-payload"));
+}
+
+#[test]
+fn chat_conversion_rejects_agent_message_without_confirmed_payload_header() {
+    let error = responses_to_chat_completions(json!({
+        "model": "custom-model",
+        "input": [{"type": "agent_message", "content": [
+            {"type": "encrypted_content", "encrypted_content": "private-agent-payload"}
+        ]}]
+    }))
+    .expect_err("缺少 Payload: 头部的 agent_message 不得透传 encrypted_content");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+    assert!(!diagnostic.contains("private-agent-payload"));
+}
+
+#[test]
+fn chat_conversion_rejects_url_safe_base64_agent_payload_as_opaque() {
+    // 合法的 base64url 密文：含 `_`，解码后可打印 ASCII 占比明显低于阈值。
+    // 字母表归一化写错时这里会退化成「解码失败 → 当明文转发」，上游收到无意义载荷。
+    let opaque = "BU6X4ClyuwRNlt8ocboDTJXeJ3C5AkuU3SZvuAFKk9wlbrcASZLbJG22_0iR2iNs";
+    let error = responses_to_chat_completions(json!({
+        "model": "custom-model",
+        "input": [{"type": "agent_message", "content": [
+            {"type": "input_text", "text": "Message Type: NEW_TASK Payload:"},
+            {"type": "encrypted_content", "encrypted_content": opaque}
+        ]}]
+    }))
+    .expect_err("base64url 密文不得按明文转发给 Chat 上游");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+    assert!(!diagnostic.contains(opaque));
+}
+
+#[test]
+fn chat_conversion_rejects_object_shaped_encrypted_content() {
+    let error = responses_to_chat_completions(json!({
+        "model": "x",
+        "input": [{"type": "message", "role": "user", "content": {
+            "type": "encrypted_content", "encrypted_content": "private-agent-payload"
+        }}]
+    }))
+    .expect_err("content 为对象形态时同样必须拒绝 encrypted_content");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+    assert!(!diagnostic.contains("private-agent-payload"));
+}
+
+#[test]
+fn chat_conversion_rejects_opaque_encrypted_agent_content_without_echoing_payload() {
+    let opaque = "mMn9x0Kc2QvZ7LtR4bYwJpE1sH6dGfUgA0TiOeNkVXqBcD9ylZsKmWrT3uPh";
+    for input in [
+        json!([{"type":"message","role":"user","content":[
+            {"type":"input_text","text":"Payload:"},
+            {"type":"encrypted_content","text":opaque}
+        ]}]),
+        json!([{"type":"encrypted_content","encrypted_content":opaque}]),
+        json!([{"type":"agent_message","content":[
+            {"type":"encrypted_content","encrypted_content":opaque}
+        ]}]),
+        json!([{"type":"agent_message","content":[
+            {"type":"input_text","text":"Payload:"},
+            {"type":"encrypted_content","encrypted_content":opaque}
+        ]}]),
+        json!({"type":"encrypted_content","encrypted_content":opaque}),
+        json!([{"type":"message","role":"user","content":[{"type":"encrypted_content"}]}]),
+    ] {
+        for standard in [false, true] {
+            let error = responses_to_chat_completions_with_options(
+                json!({"model":"custom-model","input":input}),
+                standard,
+            )
+            .expect_err("opaque encrypted agent 内容必须明确拒绝，不能静默丢弃或当作文本转发");
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+            assert!(!diagnostic.contains(opaque));
+        }
+    }
+}
+
+#[test]
+fn chat_conversion_keeps_plaintext_and_existing_reasoning_compaction_contracts() {
+    let converted = responses_to_chat_completions(json!({
+        "model":"custom-model",
+        "input":[
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"visible-summary"}],
+             "encrypted_content":"opaque-reasoning"},
+            {"type":"message","role":"user","content":[
+                {"type":"input_text","text":"Payload:"},
+                {"type":"input_text","text":"plaintext-task"}
+            ]},
+            local_compaction_item("local-summary"),
+            {"type":"function_call_output","call_id":"orphan",
+             "output":{"type":"encrypted_content","text":"tool-output-text"}}
+        ]
+    }))
+    .unwrap();
+    let messages = converted["messages"].to_string();
+    assert!(messages.contains("plaintext-task"));
+    assert!(messages.contains("visible-summary"));
+    assert!(messages.contains("local-summary"));
+    assert!(messages.contains("tool-output-text"));
+    assert!(!messages.contains("opaque-reasoning"));
+}
+
+#[tokio::test]
+async fn encrypted_agent_content_is_rejected_before_contacting_chat_upstream() {
+    for body in [
+        json!({"model":"custom-model","stream":false,"input":[
+            {"type":"encrypted_content","encrypted_content":"mMn9x0Kc2QvZ7LtR4bYwJpE1sH6dGfUgA0TiOeNkVXqBcD9ylZsKmWrT3uPh"}
+        ]}),
+        json!({"model":"x","stream":false,"input":[
+            {"type":"message","role":"user","content":{
+                "type":"encrypted_content","encrypted_content":"private-agent-payload"}}
+        ]}),
+    ] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let upstream = tokio::spawn(async move {
+            tokio::select! {
+                request = capture_json_request_once(listener) => Some(request),
+                _ = stopped => None,
+            }
+        });
+        let settings = session_header_settings(
+            RelayProtocol::ChatCompletions,
+            format!("http://{address}/v1"),
+        );
+        let result = open_responses_proxy_request_with_settings(&body.to_string(), settings).await;
+        let _ = stop.send(());
+        let request = upstream.await.unwrap();
+        assert!(result.is_err(), "必须在发送上游请求前拒绝不支持的加密内容");
+        assert!(request.is_none(), "不得向 Chat 上游发送删掉 payload 的请求");
+    }
+}
+
+#[tokio::test]
+async fn responses_upstream_preserves_encrypted_agent_content() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(capture_json_request_once(listener));
+    let request = json!({"model":"custom-model","stream":false,"input":[
+        {"type":"agent_message","sender_agent_id":"sender","recipient_agent_id":"recipient",
+         "content":[{"type":"encrypted_content","encrypted_content":"opaque-agent-payload"}]},
+        {"type":"encrypted_content","encrypted_content":"standalone-opaque-agent-payload"}
+    ]});
+    let settings =
+        session_header_settings(RelayProtocol::Responses, format!("http://{address}/v1"));
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, sent) = upstream.await.unwrap();
+    assert_eq!(sent, request);
+}
+
+#[test]
 fn compaction_stream_emits_one_done_item_before_completed() {
     let mut converter = CompactionSseConverter::new("custom-model");
     converter.push_summary_text("Preserve this summary.");
+    converter.push_upstream_bytes(b"data: {\"type\":\"response.completed\"}\n\n");
     let events = compaction_sse_events(&converter.finish());
     let mut items = Vec::new();
     let mut completed = None;
@@ -115,7 +612,7 @@ fn compaction_stream_emits_one_done_item_before_completed() {
         "compact v2 must receive one output-item event"
     );
     assert_eq!(items[0]["type"], "compaction");
-    assert_eq!(items[0]["encrypted_content"], "Preserve this summary.");
+    assert_local_compaction_summary(&items[0], "Preserve this summary.");
     assert!(
         items[0]["id"]
             .as_str()
@@ -151,11 +648,51 @@ fn compaction_sse_events(payload: &[u8]) -> Vec<Value> {
         .collect()
 }
 
+fn local_compaction_item(summary: &str) -> Value {
+    let mut converter = CompactionSseConverter::new("model");
+    converter.push_summary_text(summary);
+    converter.push_upstream_bytes(b"data: {\"type\":\"response.completed\"}\n\n");
+    compaction_sse_events(&converter.finish())
+        .into_iter()
+        .find(|event| event["type"] == "response.output_item.done")
+        .unwrap()["item"]
+        .clone()
+}
+
+fn assert_local_compaction_summary(item: &Value, summary: &str) {
+    let replay = responses_to_chat_completions(json!({"input": [item]})).unwrap();
+    let text = replay["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        text.ends_with(summary),
+        "summary must survive replay: {text}"
+    );
+}
+
+#[test]
+fn chat_conversion_rejects_unmarked_or_invalid_compaction_history() {
+    for content in [
+        "OPAQUE_NATIVE",
+        "unmarked legacy summary",
+        "codexplusplus:summary:v1:not-json",
+        "codexplusplus:summary:v1:{}",
+        "codexplusplus:summary:v1:\"\"",
+        "codexplusplus:summary:v2:\"future-format\"",
+    ] {
+        for input in [
+            json!({"type": "compaction", "encrypted_content": content}),
+            json!([{"type": "compaction", "encrypted_content": content}]),
+        ] {
+            assert!(responses_to_chat_completions(json!({"input": input})).is_err());
+        }
+    }
+}
+
 #[test]
 fn wrap_non_stream_response_produces_single_compaction_item() {
     let upstream = json!({
         "id": "resp_up",
         "object": "response",
+        "status": "completed",
         "output": [
             { "type": "reasoning", "summary": [] },
             { "type": "message", "role": "assistant",
@@ -182,7 +719,7 @@ fn wrap_non_stream_response_produces_single_compaction_item() {
 fn wrap_non_stream_chat_response_produces_single_compaction_item() {
     let upstream = json!({
         "choices": [
-            { "message": { "role": "assistant", "content": "SUMMARYfromCHAT" } }
+            { "message": { "role": "assistant", "content": "SUMMARYfromCHAT" }, "finish_reason": "stop" }
         ]
     })
     .to_string();
@@ -234,12 +771,13 @@ fn compaction_converter_accepts_data_only_responses_events() {
         b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Summary\"}\n\n",
     );
     assert_eq!(converter.summary_text(), "Summary");
-    assert!(
-        compaction_sse_events(&converter.finish())
-            .iter()
-            .any(|event| event["type"] == "response.output_item.done"
-                && event["item"]["encrypted_content"] == "Summary")
-    );
+    converter.push_upstream_bytes(b"data: {\"type\":\"response.completed\"}\n\n");
+    let events = compaction_sse_events(&converter.finish());
+    let item = &events
+        .iter()
+        .find(|event| event["type"] == "response.output_item.done")
+        .unwrap()["item"];
+    assert_local_compaction_summary(item, "Summary");
 }
 
 #[test]
@@ -256,14 +794,11 @@ fn compaction_converter_accepts_complete_text_from_done_events() {
         .iter()
         .find(|event| event["type"] == "response.output_item.done")
         .unwrap();
-    assert_eq!(
-        compaction["item"]["encrypted_content"],
-        "Summary from completed"
-    );
+    assert_local_compaction_summary(&compaction["item"], "Summary from completed");
 }
 
 #[test]
-fn compaction_converter_accepts_native_compaction_item_without_deltas() {
+fn summary_converter_does_not_relabel_native_compaction_as_local_text() {
     let upstream = concat!(
         "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque-summary\"}}\n\n",
         "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
@@ -271,16 +806,31 @@ fn compaction_converter_accepts_native_compaction_item_without_deltas() {
     let mut converter = CompactionSseConverter::new("custom-model");
     converter.push_upstream_bytes(upstream.as_bytes());
     let events = compaction_sse_events(&converter.finish());
-    let compaction = events
-        .iter()
-        .find(|event| event["type"] == "response.output_item.done")
-        .unwrap();
-    assert_eq!(compaction["item"]["encrypted_content"], "opaque-summary");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "response.failed")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event["type"] == "response.output_item.done")
+    );
+    let wrapped = wrap_non_stream_response_as_compaction(
+        br#"{"output":[{"type":"compaction","encrypted_content":"opaque-summary"}]}"#,
+        "model",
+    )
+    .unwrap();
+    assert!(
+        compaction_sse_events(&wrapped)
+            .iter()
+            .any(|event| event["type"] == "response.failed")
+    );
 }
 
 #[test]
 fn compaction_converter_accepts_complete_chat_message_without_delta() {
-    let upstream = b"data: {\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Chat summary\"}}]}\n\n";
+    let upstream = b"data: {\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Chat summary\"},\"finish_reason\":\"stop\"}]}\n\n";
     let mut converter = CompactionSseConverter::new("custom-model").with_chat_upstream();
     converter.push_upstream_bytes(upstream);
     let events = compaction_sse_events(&converter.finish());
@@ -288,7 +838,7 @@ fn compaction_converter_accepts_complete_chat_message_without_delta() {
         .iter()
         .find(|event| event["type"] == "response.output_item.done")
         .unwrap();
-    assert_eq!(compaction["item"]["encrypted_content"], "Chat summary");
+    assert_local_compaction_summary(&compaction["item"], "Chat summary");
 }
 
 #[test]
@@ -329,7 +879,7 @@ fn compaction_converter_buffers_sse_events_across_chunks() {
 #[test]
 fn compaction_converter_strips_leading_think_block_from_chat_stream() {
     // DeepSeek 类 thinking 模型把推理塞在 delta.content 的 <think> 块里。
-    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>step by step\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" reasoning...\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"</think>\\n真实摘要内容\"}}]}\n\ndata: [DONE]\n\n";
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>step by step\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" reasoning...\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"</think>\\n真实摘要内容\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
     let mut converter = CompactionSseConverter::new("deepseek").with_chat_upstream();
     converter.push_upstream_bytes(sse.as_bytes());
     let payload = String::from_utf8(converter.finish()).unwrap();
@@ -343,6 +893,7 @@ fn compaction_converter_strips_think_block_from_direct_text() {
     // 非流式路径直接 push 文本，think 剥离同样在 finish 生效。
     let mut converter = CompactionSseConverter::new("deepseek");
     converter.push_summary_text("<think>internal reasoning</think>\nSUMMARY_BODY");
+    converter.push_upstream_bytes(b"data: {\"type\":\"response.completed\"}\n\n");
     let payload = String::from_utf8(converter.finish()).unwrap();
     assert!(payload.contains("SUMMARY_BODY"));
     assert!(!payload.contains("internal reasoning"));
@@ -483,6 +1034,602 @@ async fn chat_compaction_v2_request_routes_to_summary_endpoint_and_flags_respons
     // 标记为压缩请求，交给响应包装层重组。
     assert!(result.compaction);
     assert_eq!(result.status_code, 200);
+}
+
+/// #2031：GLM 系上游只接受纯 base64，不认 `data:image/...;base64,` 前缀。
+#[test]
+fn glm_image_urls_are_stripped_to_bare_base64() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "glm-5.3-flash",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "看图" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,QUJD" }
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let url = converted["messages"][0]["content"][1]["image_url"]["url"]
+        .as_str()
+        .expect("image part survives");
+    assert_eq!(url, "QUJD");
+}
+
+/// 标准 data URL 上游（OpenAI 等）不能被这层改写波及。
+#[test]
+fn non_glm_image_urls_keep_data_url_prefix() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "gpt-5-mini",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_image", "image_url": "data:image/png;base64,QUJD" }
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let url = converted["messages"][0]["content"][0]["image_url"]["url"]
+        .as_str()
+        .expect("image part survives");
+    assert_eq!(url, "data:image/png;base64,QUJD");
+}
+
+/// 远端 https 图片既没有前缀可剥，也不该被改动。
+#[test]
+fn remote_image_urls_are_untouched_for_glm() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "glm-5.3-flash",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_image", "image_url": "https://example.com/a.png" }
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let url = converted["messages"][0]["content"][0]["image_url"]["url"]
+        .as_str()
+        .expect("image part survives");
+    assert_eq!(url, "https://example.com/a.png");
+}
+
+fn remote_compaction_settings(base_url: &str, protocol: RelayProtocol) -> BackendSettings {
+    BackendSettings {
+        active_relay_id: "compact".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "compact".to_string(),
+            name: "compact".to_string(),
+            protocol,
+            base_url: base_url.to_string(),
+            api_key: "sk-compact".to_string(),
+            relay_mode: RelayMode::Official,
+            official_mix_api_key: true,
+            hide_official_usage_alert: false,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    }
+}
+
+async fn write_remote_compaction_response(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    body: &str,
+) {
+    write_remote_compaction_typed_response(stream, status, "application/json", body).await;
+}
+
+async fn write_remote_compaction_typed_response(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-length: {}\r\ncontent-type: {content_type}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+}
+
+#[tokio::test]
+async fn responses_compaction_v2_falls_back_when_trigger_is_rejected() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for index in 0..2 {
+            let (mut stream, _) = if index == 0 {
+                listener.accept().await.unwrap()
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("fallback request should arrive")
+                    .unwrap()
+            };
+            requests.push(
+                String::from_utf8_lossy(&read_async_http_request(&mut stream).await).to_string(),
+            );
+            if index == 0 {
+                write_remote_compaction_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    r#"{"error":{"message":"unsupported compaction_trigger item"}}"#,
+                )
+                .await;
+            } else {
+                write_remote_compaction_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"COMPAT_SUMMARY"}]}]}"#,
+                )
+                .await;
+            }
+        }
+        requests
+    });
+
+    let mut result = open_responses_proxy_request_with_settings(
+        &json!({
+            "model": "model",
+            "stream": true,
+            "input": [
+                { "type": "compaction_trigger" },
+                { "type": "message", "role": "user", "content": "history" }
+            ]
+        })
+        .to_string(),
+        remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses),
+    )
+    .await
+    .unwrap();
+    let requests = server.await.unwrap();
+
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("compaction_trigger"));
+    assert!(!requests[0].contains("CONTEXT CHECKPOINT COMPACTION"));
+    assert!(!requests[1].contains("compaction_trigger"));
+    assert!(requests[1].contains("CONTEXT CHECKPOINT COMPACTION"));
+    assert_eq!(result.status_code, 200);
+    assert!(result.compaction);
+    assert!(
+        String::from_utf8(result.read_body().await.unwrap())
+            .unwrap()
+            .contains("COMPAT_SUMMARY")
+    );
+}
+
+#[tokio::test]
+async fn responses_compaction_v2_empty_output_falls_back_to_summary() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for index in 0..2 {
+            let (mut stream, _) = if index == 0 {
+                listener.accept().await.unwrap()
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("fallback request should arrive")
+                    .unwrap()
+            };
+            requests.push(
+                String::from_utf8_lossy(&read_async_http_request(&mut stream).await).to_string(),
+            );
+            let body = if index == 0 {
+                r#"{"id":"resp_empty","status":"completed","output":[]}"#
+            } else {
+                r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"FALLBACK_SUMMARY"}]}]}"#
+            };
+            write_remote_compaction_response(&mut stream, "200 OK", body).await;
+        }
+        requests
+    });
+
+    let mut result = open_responses_proxy_request_with_settings(
+        &json!({
+            "model": "model",
+            "stream": true,
+            "input": [
+                { "type": "message", "role": "user", "content": "history" },
+                { "type": "compaction_trigger" }
+            ]
+        })
+        .to_string(),
+        remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses),
+    )
+    .await
+    .unwrap();
+    let requests = server.await.unwrap();
+
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[0].contains("CONTEXT CHECKPOINT COMPACTION"));
+    assert!(requests[1].contains("CONTEXT CHECKPOINT COMPACTION"));
+    assert_eq!(result.status_code, 200);
+    assert!(result.compaction);
+    assert!(!result.native_compaction_passthrough);
+    assert!(
+        String::from_utf8(result.read_body().await.unwrap())
+            .unwrap()
+            .contains("FALLBACK_SUMMARY")
+    );
+}
+
+#[tokio::test]
+async fn responses_compaction_v2_auth_error_is_not_retried_as_summary() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request =
+            String::from_utf8_lossy(&read_async_http_request(&mut stream).await).to_string();
+        write_remote_compaction_response(
+            &mut stream,
+            "401 Unauthorized",
+            r#"{"error":{"message":"invalid API key"}}"#,
+        )
+        .await;
+        let second = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
+        (request, second.is_ok())
+    });
+
+    let mut result = open_responses_proxy_request_with_settings(
+        &json!({
+            "model": "model",
+            "stream": true,
+            "input": [{ "type": "compaction_trigger" }]
+        })
+        .to_string(),
+        remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses),
+    )
+    .await
+    .unwrap();
+    let (request, retried) = server.await.unwrap();
+
+    assert!(request.contains("compaction_trigger"));
+    assert!(!retried);
+    assert_eq!(result.status_code, 401);
+    assert!(!result.native_compaction_passthrough);
+    assert!(
+        String::from_utf8(result.read_body().await.unwrap())
+            .unwrap()
+            .contains("invalid API key")
+    );
+}
+
+#[tokio::test]
+async fn native_compaction_errors_are_forwarded_without_summary_retry() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    for status in [429, 503] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("Retry-After", "60")
+                    .set_body_json(json!({"error": {"message": "capacity exceeded"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = remote_compaction_settings(&server.uri(), RelayProtocol::Responses);
+        let mut response = open_responses_proxy_request_with_settings(
+            &json!({"model": "model", "stream": true, "input": [{"type": "compaction_trigger"}]})
+                .to_string(),
+            config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status_code, status);
+        assert!(
+            String::from_utf8(response.read_body().await.unwrap())
+                .unwrap()
+                .contains("capacity exceeded")
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(String::from_utf8_lossy(&requests[0].body).contains("compaction_trigger"));
+    }
+}
+
+#[tokio::test]
+async fn responses_compaction_v2_stream_failure_is_forwarded_without_summary_retry() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let failure = concat!(
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",",
+        "\"status\":\"failed\",\"error\":{\"message\":\"upstream capacity exceeded\"}}}\n\n"
+    );
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request =
+            String::from_utf8_lossy(&read_async_http_request(&mut stream).await).to_string();
+        write_remote_compaction_typed_response(&mut stream, "200 OK", "text/event-stream", failure)
+            .await;
+        let second = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
+        (request, second.is_ok())
+    });
+
+    let mut result = open_responses_proxy_request_with_settings(
+        &json!({
+            "model": "model",
+            "stream": true,
+            "input": [{ "type": "compaction_trigger" }]
+        })
+        .to_string(),
+        remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses),
+    )
+    .await
+    .unwrap();
+    let (request, retried) = server.await.unwrap();
+
+    assert!(request.contains("compaction_trigger"));
+    assert!(!retried);
+    assert!(result.native_compaction_passthrough);
+    assert_eq!(
+        result.read_body().await.unwrap(),
+        failure.as_bytes().to_vec()
+    );
+}
+
+#[tokio::test]
+async fn responses_compaction_v2_truncated_stream_is_not_retried() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let partial = concat!(
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+    );
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request =
+            String::from_utf8_lossy(&read_async_http_request(&mut stream).await).to_string();
+        write_remote_compaction_typed_response(&mut stream, "200 OK", "text/event-stream", partial)
+            .await;
+        let second = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
+        (request, second.is_ok())
+    });
+
+    let mut result = open_responses_proxy_request_with_settings(
+        &json!({
+            "model": "model",
+            "stream": true,
+            "input": [{ "type": "compaction_trigger" }]
+        })
+        .to_string(),
+        remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses),
+    )
+    .await
+    .unwrap();
+    let (request, retried) = server.await.unwrap();
+
+    assert!(request.contains("compaction_trigger"));
+    assert!(!retried);
+    assert!(result.native_compaction_passthrough);
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("response.failed"));
+    assert!(body.contains("stream closed before response.completed"));
+    assert!(!body.contains("CONTEXT CHECKPOINT COMPACTION"));
+}
+
+#[tokio::test]
+async fn responses_compaction_v2_json_native_item_becomes_full_sse() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request =
+            String::from_utf8_lossy(&read_async_http_request(&mut stream).await).to_string();
+        write_remote_compaction_response(
+            &mut stream,
+            "200 OK",
+            r#"{"id":"resp_native","status":"completed","output":[{"id":"cmp_native","type":"compaction","encrypted_content":"OPAQUE_JSON"}]}"#,
+        )
+        .await;
+        let second = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
+        (request, second.is_ok())
+    });
+
+    let mut result = open_responses_proxy_request_with_settings(
+        &json!({
+            "model": "model",
+            "stream": true,
+            "input": [{ "type": "compaction_trigger" }]
+        })
+        .to_string(),
+        remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses),
+    )
+    .await
+    .unwrap();
+    let (request, retried) = server.await.unwrap();
+
+    assert!(request.contains("compaction_trigger"));
+    assert!(!retried);
+    assert!(result.native_compaction_passthrough);
+    assert!(result.is_stream);
+    let events = compaction_sse_events(&result.read_body().await.unwrap());
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "response.created",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.completed"
+        ]
+    );
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event["sequence_number"], index);
+    }
+    assert_eq!(events[2]["item"]["encrypted_content"], "OPAQUE_JSON");
+}
+
+#[tokio::test]
+async fn responses_compaction_v2_sse_rejects_empty_encrypted_content() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for index in 0..2 {
+            let (mut stream, _) = if index == 0 {
+                listener.accept().await.unwrap()
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .expect("fallback request should arrive")
+                    .unwrap()
+            };
+            requests.push(
+                String::from_utf8_lossy(&read_async_http_request(&mut stream).await).to_string(),
+            );
+            if index == 0 {
+                write_remote_compaction_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"event: response.output_item.done
+
+data: {"type":"response.output_item.done","item":{"id":"cmp_empty","type":"compaction","encrypted_content":""}}
+
+event: response.completed
+
+data: {"type":"response.completed","response":{"id":"resp_empty","status":"completed"}}
+
+"#,
+                )
+                .await;
+            } else {
+                write_remote_compaction_response(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"COMPAT_SUMMARY"}]}]}"#,
+                )
+                .await;
+            }
+        }
+        requests
+    });
+
+    let mut result = open_responses_proxy_request_with_settings(
+        &json!({
+            "model": "model",
+            "stream": true,
+            "input": [{ "type": "compaction_trigger" }]
+        })
+        .to_string(),
+        remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses),
+    )
+    .await
+    .unwrap();
+    let requests = server.await.unwrap();
+
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].contains("compaction_trigger"));
+    assert!(!requests[1].contains("compaction_trigger"));
+    assert!(result.compaction);
+    assert!(!result.native_compaction_passthrough);
+    assert!(
+        String::from_utf8(result.read_body().await.unwrap())
+            .unwrap()
+            .contains("COMPAT_SUMMARY")
+    );
+}
+
+#[tokio::test]
+async fn native_compaction_history_returns_responses_error_without_fallback() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request =
+            String::from_utf8_lossy(&read_async_http_request(&mut stream).await).to_string();
+        write_remote_compaction_response(
+            &mut stream,
+            "400 Bad Request",
+            r#"{"error":{"message":"unsupported compaction_trigger item"}}"#,
+        )
+        .await;
+        let fallback = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
+        (request, fallback.is_ok())
+    });
+
+    let mut result = open_responses_proxy_request_with_settings(
+        &json!({
+            "model": "model",
+            "stream": true,
+            "input": [
+                { "type": "compaction", "encrypted_content": "OPAQUE_NATIVE" },
+                { "type": "compaction_trigger" }
+            ]
+        })
+        .to_string(),
+        remote_compaction_settings(&format!("http://{address}/v1"), RelayProtocol::Responses),
+    )
+    .await
+    .expect("native history incompatibility is a Responses error, not a proxy failure");
+    let (request, retried) = server.await.unwrap();
+
+    assert!(request.contains("OPAQUE_NATIVE"));
+    assert!(!retried);
+    assert_eq!(result.status_code, 400);
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("native_compaction_unsupported"));
+    assert!(body.contains("compaction_incompatible"));
+}
+
+#[tokio::test]
+async fn native_compaction_history_on_chat_upstream_returns_responses_error() {
+    let mut result = open_responses_proxy_request_with_settings(
+        &json!({
+            "model": "model",
+            "stream": false,
+            "input": [
+                { "type": "compaction", "encrypted_content": "OPAQUE_NATIVE" },
+                { "type": "compaction_trigger" }
+            ]
+        })
+        .to_string(),
+        remote_compaction_settings("http://127.0.0.1:9/v1", RelayProtocol::ChatCompletions),
+    )
+    .await
+    .expect("chat conversion refusal is a Responses error, not a proxy failure");
+
+    assert_eq!(result.status_code, 400);
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("native_compaction_unsupported"));
+    assert!(body.contains("compaction_incompatible"));
 }
 
 #[test]
@@ -653,15 +1800,10 @@ async fn responses_compact_request_keeps_compact_path_upstream() {
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut buffer = [0; 4096];
-        let read = stream.read(&mut buffer).await.unwrap();
-        let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_1\",\"object\":\"response\"}",
-            )
-            .await
-            .unwrap();
+        let request =
+            String::from_utf8_lossy(&read_async_http_request(&mut stream).await).to_string();
+        write_remote_compaction_response(&mut stream, "200 OK",
+            r#"{"id":"resp_1","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque-fixture"}]}"#).await;
         request
     });
     let settings = BackendSettings {
@@ -782,6 +1924,20 @@ fn responses_request_maps_kimi_coding_reasoning_effort_per_official_spec() {
     .unwrap();
     assert_eq!(off["thinking"]["type"], "disabled");
     assert!(off.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn kimi_k3_standard_protocol_avoids_adaptive_and_preserves_opt_in_vendor_behavior() {
+    for model in ["kimi-k3", "k3-256k"] {
+        let request = json!({"model":model,"reasoning":{"effort":"xhigh"},"input":"hello"});
+        let standard = responses_to_chat_completions_with_options(request.clone(), true).unwrap();
+        assert!(standard.get("thinking").is_none());
+        assert!(standard.get("reasoning_effort").is_none());
+        let vendor = responses_to_chat_completions_with_options(request, false).unwrap();
+        assert_eq!(vendor["thinking"]["type"], "adaptive");
+        assert_eq!(vendor["reasoning_effort"], "max");
+        assert_eq!(standard["messages"], vendor["messages"]);
+    }
 }
 
 #[test]
@@ -1413,9 +2569,7 @@ fn responses_request_relocates_developer_notice_between_tool_outputs() {
         );
         // 相邻前一条不能是 developer 通知（说明夹心已被搬走）。
         if position > 0 {
-            let previous = messages[position - 1]["content"]
-                .as_str()
-                .unwrap_or("");
+            let previous = messages[position - 1]["content"].as_str().unwrap_or("");
             assert!(
                 !previous.contains("image_resize_notice"),
                 "夹心通知仍插在 tool 结果之间"
@@ -1571,8 +2725,14 @@ fn responses_request_flattens_top_level_one_of_in_tool_parameters() {
 
     let properties = parameters["properties"].as_object().unwrap();
     assert!(properties.contains_key("mode"), "分支共有的字段应并入");
-    assert!(properties.contains_key("targetThreadId"), "分支独有字段应并入");
-    assert!(properties.contains_key("note"), "第二个分支的独有字段应并入");
+    assert!(
+        properties.contains_key("targetThreadId"),
+        "分支独有字段应并入"
+    );
+    assert!(
+        properties.contains_key("note"),
+        "第二个分支的独有字段应并入"
+    );
 
     // required 取交集：只有 mode 是所有分支都要求的。
     let required: Vec<&str> = parameters["required"]
@@ -2107,7 +3267,7 @@ async fn strict_provider_accepts(tools: Value) -> Result<(Value, u16, Value), (u
         "stream": false,
         "tools": tools
     });
-    let result = open_responses_proxy_request_with_settings(
+    let mut result = open_responses_proxy_request_with_settings(
         &serde_json::to_string(&request).unwrap(),
         settings,
     )
@@ -2115,8 +3275,7 @@ async fn strict_provider_accepts(tools: Value) -> Result<(Value, u16, Value), (u
     .expect("修复后：代理请求应成功完成（状态 200）");
     let status_code = result.status_code;
     let upstream_body = server.await.unwrap();
-    let response_body: Value =
-        serde_json::from_slice(&result.response.bytes().await.unwrap()).unwrap();
+    let response_body: Value = serde_json::from_slice(&result.read_body().await.unwrap()).unwrap();
     Ok((upstream_body, status_code, response_body))
 }
 
@@ -2245,7 +3404,7 @@ fn responses_request_maps_codex_custom_and_namespace_tools_to_chat_functions() {
         .collect();
     assert!(names.contains(&"exec"));
     assert!(names.contains(&"mcp__vscode_mcp__open_file"));
-    assert!(names.contains(&"web_search"));
+    assert!(!names.contains(&"web_search"));
     assert_eq!(
         converted["tools"][0]["function"]["parameters"]["properties"]["input"]["type"],
         "string"
@@ -2258,7 +3417,7 @@ fn responses_request_maps_codex_custom_and_namespace_tools_to_chat_functions() {
 }
 
 #[test]
-fn responses_request_stream_includes_usage_and_apply_patch_proxy_tools() {
+fn responses_request_stream_includes_usage_and_raw_apply_patch_tool() {
     let converted = responses_to_chat_completions(json!({
         "model": "gpt-5-mini",
         "input": "hi",
@@ -2281,25 +3440,18 @@ fn responses_request_stream_includes_usage_and_apply_patch_proxy_tools() {
         .iter()
         .map(|tool| tool["function"]["name"].as_str().unwrap())
         .collect();
+    assert_eq!(names, vec!["apply_patch"]);
     assert_eq!(
-        names,
-        vec![
-            "apply_patch_add_file",
-            "apply_patch_delete_file",
-            "apply_patch_update_file",
-            "apply_patch_replace_file",
-            "apply_patch_batch"
-        ]
+        converted["tools"][0]["function"]["parameters"]["properties"]["input"]["type"],
+        "string"
     );
-    assert_eq!(
-        converted["tools"][2]["function"]["parameters"]["properties"]["hunks"]["items"]["properties"]
-            ["lines"]["items"]["required"],
-        json!(["op", "text"])
+    assert!(
+        converted["tools"][0]["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Original tool definition:")
     );
-    assert_eq!(
-        converted["tool_choice"]["function"]["name"],
-        "apply_patch_batch"
-    );
+    assert_eq!(converted["tool_choice"]["function"]["name"], "apply_patch");
 }
 
 #[test]
@@ -2508,11 +3660,73 @@ fn responses_input_replays_apply_patch_custom_history_as_proxy_tool() {
 
     assert_eq!(
         converted["messages"][0]["tool_calls"][0]["function"]["name"],
-        "apply_patch_add_file"
+        "apply_patch"
     );
     assert_eq!(
         converted["messages"][0]["tool_calls"][0]["function"]["arguments"],
-        "{\"content\":\"# Test\",\"path\":\"docs/test.md\"}"
+        "{\"input\":\"*** Begin Patch\\n*** Add File: docs/test.md\\n+# Test\\n*** End Patch\"}"
+    );
+}
+
+#[test]
+fn responses_input_migrates_legacy_apply_patch_proxy_history() {
+    for legacy_name in [
+        "apply_patch_add_file",
+        "apply_patch_delete_file",
+        "apply_patch_update_file",
+        "apply_patch_replace_file",
+        "apply_patch_batch",
+    ] {
+        let raw_patch = "*** Begin Patch\n*** Add File: docs/test.md\n+# Test\n*** End Patch";
+        let converted = responses_to_chat_completions(json!({
+            "model": "gpt-5-mini",
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_legacy_patch",
+                    "name": legacy_name,
+                    "input": raw_patch
+                }
+            ],
+            "tools": [{ "type": "custom", "name": "apply_patch" }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            converted["messages"][0]["tool_calls"][0]["function"]["name"],
+            "apply_patch"
+        );
+        let arguments = converted["messages"][0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap();
+        let arguments: Value = serde_json::from_str(arguments).unwrap();
+        assert_eq!(arguments["input"], raw_patch);
+    }
+}
+
+#[test]
+fn responses_input_replays_same_path_delete_add_patch_as_apply_patch() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "gpt-5-mini",
+        "input": [
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** Delete File: docs/test.md\n*** Add File: docs/test.md\n+hello\n*** End Patch"
+            }
+        ],
+        "tools": [{ "type": "custom", "name": "apply_patch" }]
+    }))
+    .unwrap();
+
+    assert_eq!(
+        converted["messages"][0]["tool_calls"][0]["function"]["name"],
+        "apply_patch"
+    );
+    assert_eq!(
+        converted["messages"][0]["tool_calls"][0]["function"]["arguments"],
+        "{\"input\":\"*** Begin Patch\\n*** Delete File: docs/test.md\\n*** Add File: docs/test.md\\n+hello\\n*** End Patch\"}"
     );
 }
 
@@ -2617,6 +3831,118 @@ fn chat_completion_response_maps_reasoning_tool_calls_and_usage_details() {
     assert_eq!(
         converted["usage"]["output_tokens_details"]["reasoning_tokens"],
         2
+    );
+}
+
+/// #332 / #1012：Gemini 3 系要求 functionCall 回传 thought_signature，否则整轮 400。
+/// 签名由上游产生、本仓不理解其语义，因此原样透传 `extra_content`：
+/// 上游返回时记住（按 call_id），下一轮构造请求时挂回对应的 tool_call。
+#[test]
+fn gemini_thought_signature_is_carried_back_across_turns() {
+    // 第一轮：上游在 tool_call 上带了 extra_content
+    let converted = chat_completion_to_response(json!({
+        "id": "chatcmpl_sig",
+        "created": 123,
+        "model": "gemini-3.5-flash",
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_sig",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}" },
+                    "extra_content": { "google": { "thought_signature": "SIG-ABC" } }
+                }]
+            }
+        }]
+    }))
+    .unwrap();
+
+    let call_id = converted["output"][0]["call_id"]
+        .as_str()
+        .expect("tool call survives")
+        .to_string();
+
+    // 第二轮：客户端把这个 function_call 作为历史带回来
+    let replayed = responses_to_chat_completions(json!({
+        "model": "gemini-3.5-flash",
+        "input": [
+            { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "天气" }] },
+            {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Tokyo\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "sunny"
+            }
+        ]
+    }))
+    .unwrap();
+
+    let tool_call = replayed["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .and_then(|calls| calls.first())
+        .expect("tool call replayed into chat history");
+    assert_eq!(
+        tool_call["extra_content"]["google"]["thought_signature"], "SIG-ABC",
+        "签名字段必须原样回到下一轮请求"
+    );
+}
+
+/// 无 extra_content 时不得凭空造字段（其它供应商不受影响）。
+#[test]
+fn tool_call_without_extra_content_replays_without_the_field() {
+    let converted = chat_completion_to_response(json!({
+        "id": "chatcmpl_plain",
+        "created": 123,
+        "model": "gpt-5.4",
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_plain",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}" }
+                }]
+            }
+        }]
+    }))
+    .unwrap();
+
+    let call_id = converted["output"][0]["call_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let replayed = responses_to_chat_completions(json!({
+        "model": "gpt-5.4",
+        "input": [
+            { "type": "function_call", "call_id": call_id, "name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}" },
+            { "type": "function_call_output", "call_id": call_id, "output": "sunny" }
+        ]
+    }))
+    .unwrap();
+
+    let tool_call = replayed["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .and_then(|calls| calls.first())
+        .expect("tool call replayed");
+    assert!(
+        tool_call.get("extra_content").is_none(),
+        "没有附带数据时不应凭空造 extra_content"
     );
 }
 
@@ -2820,8 +4146,8 @@ fn chat_completion_response_reconstructs_apply_patch_proxy_call() {
                         "id": "call_patch",
                         "type": "function",
                         "function": {
-                            "name": "apply_patch_add_file",
-                            "arguments": "{\"path\":\"README.md\",\"content\":\"hello\"}"
+                            "name": "apply_patch",
+                            "arguments": "{\"input\":\"*** Begin Patch\\n*** Add File: README.md\\n+hello\\n*** End Patch\"}"
                         }
                     }]
                 }
@@ -2843,7 +4169,7 @@ fn chat_completion_response_reconstructs_apply_patch_proxy_call() {
 }
 
 #[test]
-fn chat_completion_response_remaps_string_apply_patch_proxy_tools() {
+fn chat_completion_response_remaps_string_apply_patch_tool() {
     let converted = chat_completion_to_response_with_request(
         json!({
             "id": "chatcmpl_patch_string_tool",
@@ -2857,8 +4183,8 @@ fn chat_completion_response_remaps_string_apply_patch_proxy_tools() {
                         "id": "call_patch",
                         "type": "function",
                         "function": {
-                            "name": "apply_patch_add_file",
-                            "arguments": "{\"path\":\"docs/test.md\",\"content\":\"# Test\\n\"}"
+                            "name": "apply_patch",
+                            "arguments": "{\"input\":\"*** Begin Patch\\n*** Add File: docs/test.md\\n+# Test\\n*** End Patch\"}"
                         }
                     }]
                 }
@@ -2866,7 +4192,7 @@ fn chat_completion_response_remaps_string_apply_patch_proxy_tools() {
         }),
         &json!({
             "model": "gpt-5-mini",
-            "tools": ["apply_patch_add_file", "apply_patch_batch"]
+            "tools": ["apply_patch"]
         }),
     )
     .unwrap();
@@ -3266,7 +4592,53 @@ async fn upstream_request_returns_when_provider_accepts_but_never_sends_headers(
     .await;
 
     assert!(result.is_err());
-    assert!(started.elapsed() < Duration::from_secs(1));
+    // 断言意图：客户端在 header 超时（100ms）后放弃等待，而不是傻等上游那 2 秒。
+    // 上限取 1.5s：既与「傻等 2 秒」有明确区分，又给满负载下的调度抖动留出余量。
+    // 原先写 1s，跑全量测试（几十个 target 并发）时会间歇性越界。
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    server.abort();
+}
+
+/// 系统代理/链路抖动经常表现为 TLS 握手阶段被对端断开
+/// （`client error (Connect): tls handshake eof`）。这类失败发生在请求送达
+/// 上游之前，必须在本地重试，不能把瞬时故障直接暴露成 502。
+#[tokio::test]
+async fn upstream_connect_failures_are_retried_before_reporting_502() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            // 握手阶段直接断开，复现 tls handshake eof。
+            drop(stream);
+        }
+    });
+
+    let started = Instant::now();
+    let error = send_upstream_request_with_header_timeout(
+        upstream_http_client()
+            .unwrap()
+            .post(format!("https://{addr}/v1/responses"))
+            .json(&json!({"model": "m", "input": "hi"})),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("上游请求失败"), "{text}");
+    assert!(
+        accepted.load(Ordering::SeqCst) >= 3,
+        "expected initial attempt plus 2 connect retries"
+    );
+    // 两次退避合计 550ms，证明不是一次失败就立刻返回。
+    assert!(started.elapsed() >= Duration::from_millis(500));
     server.abort();
 }
 
@@ -3300,16 +4672,21 @@ async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
         relay.api_key.clear();
     }
 
-    let result = open_responses_proxy_request_with_settings(
+    let mut result = open_responses_proxy_request_with_settings(
         r#"{"model":"gpt-5-mini","input":"hi","stream":false}"#,
         settings,
     )
     .await
     .unwrap();
-    let body = result.response.bytes().await.unwrap();
+    let body = result.read_body().await.unwrap();
 
-    assert_eq!(result.status_code, 200);
-    assert_eq!(body.as_ref(), br#"{"id":"resp_1","object":"response"}"#);
+    assert_eq!(
+        result.status_code,
+        200,
+        "unexpected mock response: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(body.as_slice(), br#"{"id":"resp_1","object":"response"}"#);
     let first_request = first_server.await.unwrap();
     let second_request = second_server.await.unwrap();
     assert!(
@@ -3321,6 +4698,376 @@ async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
         !second_request
             .to_ascii_lowercase()
             .contains("authorization:")
+    );
+}
+
+/// 官方登录成员：聚合代理用该账号 OAuth 凭据把请求转发到 chatgpt.com 后端，
+/// 带 OAuth Bearer 与 `chatgpt-account-id`，不能带供应商 API Key。
+#[tokio::test]
+async fn aggregate_official_member_forwards_with_oauth_credentials() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_json_request_once(listener));
+    let _env_guard = EnvVarGuard::set(
+        "CODEX_PLUS_OFFICIAL_BASE_URL",
+        &format!("http://{address}/backend-api/codex"),
+    );
+
+    let official_id = "proxy-official-login".to_string();
+    let aggregate_id = "proxy-official-agg".to_string();
+    let settings = BackendSettings {
+        relay_profiles: vec![
+            RelayProfile {
+                id: official_id.clone(),
+                name: "官方登录".to_string(),
+                relay_mode: RelayMode::Official,
+                auth_contents: json!({
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "access_token": "official-access",
+                        "refresh_token": "official-refresh",
+                        "account_id": "acct-official"
+                    }
+                })
+                .to_string(),
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: aggregate_id.clone(),
+                name: "aggregate".to_string(),
+                relay_mode: RelayMode::Aggregate,
+                ..RelayProfile::default()
+            },
+        ],
+        active_relay_id: aggregate_id.clone(),
+        active_aggregate_relay_id: aggregate_id.clone(),
+        aggregate_relay_profiles: vec![AggregateRelayProfile {
+            id: aggregate_id,
+            name: "aggregate".to_string(),
+            session_provider: RelaySessionProvider::Custom,
+            model_aggregation_enabled: false,
+            strategy: AggregateRelayStrategy::Failover,
+            members: vec![AggregateRelayMember {
+                relay_id: official_id,
+                weight: 1,
+            }],
+            routes: Vec::new(),
+            default_relay_id: String::new(),
+            sync_default_member_login: false,
+        }],
+        ..BackendSettings::default()
+    };
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-sol","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let (headers, body) = server.await.unwrap();
+    let headers_lower = headers.to_ascii_lowercase();
+    assert!(
+        headers.starts_with("POST /backend-api/codex/responses HTTP/1.1"),
+        "{headers}"
+    );
+    assert!(
+        headers_lower.contains("authorization: bearer official-access"),
+        "{headers}"
+    );
+    assert!(
+        headers_lower.contains("chatgpt-account-id: acct-official"),
+        "{headers}"
+    );
+    assert!(headers_lower.contains("originator: codex_cli_rs"), "{headers}");
+    assert!(!headers_lower.contains("sk-"), "{headers}");
+    assert_eq!(body["model"], "gpt-5.6-sol");
+}
+
+/// 官方登录成员 + 单成员聚合外壳，用于验证官方登录通道的请求重写。
+fn official_aggregate_test_settings(official_id: &str, aggregate_id: &str) -> BackendSettings {
+    BackendSettings {
+        relay_profiles: vec![
+            RelayProfile {
+                id: official_id.to_string(),
+                name: "官方登录".to_string(),
+                relay_mode: RelayMode::Official,
+                auth_contents: json!({
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "access_token": "official-access",
+                        "refresh_token": "official-refresh",
+                        "account_id": "acct-official"
+                    }
+                })
+                .to_string(),
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: aggregate_id.to_string(),
+                name: "aggregate".to_string(),
+                relay_mode: RelayMode::Aggregate,
+                ..RelayProfile::default()
+            },
+        ],
+        active_relay_id: aggregate_id.to_string(),
+        active_aggregate_relay_id: aggregate_id.to_string(),
+        aggregate_relay_profiles: vec![AggregateRelayProfile {
+            id: aggregate_id.to_string(),
+            name: "aggregate".to_string(),
+            session_provider: RelaySessionProvider::Custom,
+            model_aggregation_enabled: false,
+            strategy: AggregateRelayStrategy::Failover,
+            members: vec![AggregateRelayMember {
+                relay_id: official_id.to_string(),
+                weight: 1,
+            }],
+            routes: Vec::new(),
+            default_relay_id: String::new(),
+            sync_default_member_login: false,
+        }],
+        ..BackendSettings::default()
+    }
+}
+
+/// 官方登录上游要求：回放 web_search_call 历史时必须声明 web_search 工具，
+/// 否则流式返回 `response protection is unavailable`。Codex 的本地压缩请求
+/// `tools` 为空，必须由代理补齐声明（且不能改写历史）。
+#[tokio::test]
+async fn aggregate_official_member_declares_web_search_for_tool_less_history() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    // 隔离真实 ~/.codex/auth.json，避免 live 登录快照影响凭据解析。
+    let _codex_home = EnvVarGuard::set(
+        "CODEX_HOME",
+        temp.path().to_str().unwrap(),
+    );
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_json_request_once(listener));
+    let _env_guard = EnvVarGuard::set(
+        "CODEX_PLUS_OFFICIAL_BASE_URL",
+        &format!("http://{address}/backend-api/codex"),
+    );
+
+    let request = json!({
+        "model": "gpt-6.1-sol",
+        "stream": false,
+        "tools": [],
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "web_search_call", "id": "ws_test", "status": "completed",
+                "action": {"type": "search", "query": "example"}},
+            {"type": "message", "role": "user", "content": [{"type": "input_text",
+                "text": "You are performing a CONTEXT CHECKPOINT COMPACTION."}]}
+        ]
+    });
+    let settings = official_aggregate_test_settings("proxy-official-web", "proxy-official-web-agg");
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let (headers, sent) = server.await.unwrap();
+    assert!(
+        headers.starts_with("POST /backend-api/codex/responses HTTP/1.1"),
+        "{headers}"
+    );
+    let mut expected = request;
+    expected["tools"] = json!([{"type": "web_search", "external_web_access": false}]);
+    expected["tool_choice"] = json!("none");
+    assert_eq!(sent, expected, "只补搜索声明，历史内容必须原样保留");
+}
+
+/// 官方登录通道只修「没有声明任何工具」的请求；带工具的普通轮次保持原样。
+#[tokio::test]
+async fn aggregate_official_member_leaves_tool_declaring_requests_unchanged() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    let _codex_home = EnvVarGuard::set(
+        "CODEX_HOME",
+        temp.path().to_str().unwrap(),
+    );
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_json_request_once(listener));
+    let _env_guard = EnvVarGuard::set(
+        "CODEX_PLUS_OFFICIAL_BASE_URL",
+        &format!("http://{address}/backend-api/codex"),
+    );
+
+    let request = json!({
+        "model": "gpt-6.1-sol",
+        "stream": false,
+        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+        "tool_choice": "auto",
+        "input": [
+            {"type": "web_search_call", "id": "ws_test", "status": "completed",
+                "action": {"type": "search", "query": "example"}},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+        ]
+    });
+    let settings =
+        official_aggregate_test_settings("proxy-official-tools", "proxy-official-tools-agg");
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings)
+        .await
+        .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let (_, sent) = server.await.unwrap();
+    assert_eq!(sent, request, "带工具的请求不应被改写");
+}
+
+/// 官方登录 token 被提前撤销：第一次 401 后强制刷新一次并原样重试，
+/// 第二次请求带刷新后的 Bearer；refresh 请求带轮换前的 refresh token。
+#[tokio::test]
+async fn aggregate_official_member_refreshes_and_retries_after_401() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+
+    let upstream = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let upstream_server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        let (mut first, _) = upstream.accept().await.unwrap();
+        requests.push(read_http_request(&mut first).await);
+        first
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 2\r\ncontent-type: application/json\r\n\r\n{}",
+            )
+            .await
+            .unwrap();
+        drop(first);
+        let (mut second, _) = upstream.accept().await.unwrap();
+        requests.push(read_http_request(&mut second).await);
+        second
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 35\r\ncontent-type: application/json\r\n\r\n{\"id\":\"resp_1\",\"object\":\"response\"}",
+            )
+            .await
+            .unwrap();
+        requests
+    });
+    let token = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let token_addr = token.local_addr().unwrap();
+    let token_server = tokio::spawn(async move {
+        let (mut stream, _) = token.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await;
+        let body = r#"{"access_token":"refreshed-access","refresh_token":"refreshed-refresh"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        request
+    });
+
+    let _base_env = EnvVarGuard::set(
+        "CODEX_PLUS_OFFICIAL_BASE_URL",
+        &format!("http://{upstream_addr}/backend-api/codex"),
+    );
+    let _token_env = EnvVarGuard::set(
+        "CODEX_PLUS_OFFICIAL_TOKEN_URL",
+        &format!("http://{token_addr}/oauth/token"),
+    );
+
+    let official_id = "proxy-official-401".to_string();
+    let aggregate_id = "proxy-official-401-agg".to_string();
+    let settings = BackendSettings {
+        relay_profiles: vec![
+            RelayProfile {
+                id: official_id.clone(),
+                name: "官方登录".to_string(),
+                relay_mode: RelayMode::Official,
+                auth_contents: json!({
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "access_token": "official-access",
+                        "refresh_token": "official-refresh",
+                        "account_id": "acct-official"
+                    }
+                })
+                .to_string(),
+                ..RelayProfile::default()
+            },
+            RelayProfile {
+                id: aggregate_id.clone(),
+                name: "aggregate".to_string(),
+                relay_mode: RelayMode::Aggregate,
+                ..RelayProfile::default()
+            },
+        ],
+        active_relay_id: aggregate_id.clone(),
+        active_aggregate_relay_id: aggregate_id.clone(),
+        aggregate_relay_profiles: vec![AggregateRelayProfile {
+            id: aggregate_id,
+            name: "aggregate".to_string(),
+            session_provider: RelaySessionProvider::Custom,
+            model_aggregation_enabled: false,
+            strategy: AggregateRelayStrategy::Failover,
+            members: vec![AggregateRelayMember {
+                relay_id: official_id,
+                weight: 1,
+            }],
+            routes: Vec::new(),
+            default_relay_id: String::new(),
+            sync_default_member_login: false,
+        }],
+        ..BackendSettings::default()
+    };
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-sol","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.status_code, 200);
+
+    let requests = upstream_server.await.unwrap();
+    assert!(
+        requests[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer official-access"),
+        "{}",
+        requests[0]
+    );
+    assert!(
+        requests[1]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer refreshed-access"),
+        "{}",
+        requests[1]
+    );
+    let token_request = token_server.await.unwrap();
+    assert!(
+        token_request.contains("grant_type=refresh_token"),
+        "{token_request}"
+    );
+    assert!(
+        token_request.contains("refresh_token=official-refresh"),
+        "{token_request}"
     );
 }
 
@@ -3472,7 +5219,8 @@ async fn model_route_preserves_responses_compact_endpoint() {
         .await
         .unwrap();
     let target_addr = target.local_addr().unwrap();
-    let target_server = tokio::spawn(capture_json_request_once(target));
+    let target_server = tokio::spawn(capture_request_with_response(target, "application/json",
+        json!({"id":"compact","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque-fixture"}]}).to_string()));
     let request = json!({
         "model": "gpt-5.6-luna",
         "input": [{ "role": "user", "content": "compact this conversation" }],
@@ -3677,6 +5425,228 @@ async fn aggregate_proxy_rewrites_requested_model_to_selected_member_default_mod
     fallback_server.abort();
 }
 
+#[tokio::test]
+async fn aggregate_prefixed_model_binds_member_and_preserves_upstream_model() {
+    let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let first_addr = first.local_addr().unwrap();
+    let second = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let second_addr = second.local_addr().unwrap();
+    let first_server = tokio::spawn(capture_json_request_once(first));
+    let second_server = tokio::spawn(respond_once(
+        second,
+        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n",
+    ));
+    let mut settings = aggregate_proxy_settings(
+        "prefixed-model",
+        format!("http://{first_addr}/v1"),
+        format!("http://{second_addr}/v1"),
+    );
+    for relay in settings.relay_profiles.iter_mut().take(2) {
+        relay.relay_mode = RelayMode::PureApi;
+        relay.no_auth = true;
+        relay.api_key.clear();
+    }
+    let first_id = settings.relay_profiles[0].id.clone();
+    settings.relay_profiles[0].model = "deepseek-v4-pro".to_string();
+    settings.relay_profiles[0].model_list = "deepseek-v4-pro".to_string();
+    settings.aggregate_relay_profiles[0].model_aggregation_enabled = true;
+
+    let request = format!(
+        r#"{{"model":"cpx-{first_id}/deepseek-v4-pro","input":"hi","stream":false}}"#
+    );
+    let mut result = open_responses_proxy_request_with_settings(&request, settings)
+        .await
+        .unwrap();
+    let (_, body) = first_server.await.unwrap();
+    assert_eq!(result.status_code, 200);
+    assert_eq!(body["model"], "deepseek-v4-pro");
+    let response: Value = serde_json::from_slice(&result.read_body().await.unwrap()).unwrap();
+    assert_eq!(response["id"], "resp_model_route");
+    second_server.abort();
+}
+
+/// 模型聚合 + 默认供应商：解析不到成员的普通模型名固定发往默认成员，
+/// 上游模型名去掉 `<前缀>/` 与窗口后缀；未设置默认时保持原有 400。
+#[tokio::test]
+async fn aggregate_default_provider_forwards_unbound_model() {
+    let default_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let default_addr = default_listener.local_addr().unwrap();
+    let other_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let other_addr = other_listener.local_addr().unwrap();
+    let default_server = tokio::spawn(capture_json_request_once(default_listener));
+    let other_server = tokio::spawn(respond_once(
+        other_listener,
+        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\r\n",
+    ));
+    let request = r#"{"model":"ccs-legacy/gpt-9.9-unknown[1M]","input":"hi","stream":false}"#;
+    let base = aggregate_proxy_settings(
+        "default-provider",
+        format!("http://{other_addr}/v1"),
+        format!("http://{default_addr}/v1"),
+    );
+
+    let mut without_default = base.clone();
+    without_default.aggregate_relay_profiles[0].model_aggregation_enabled = true;
+    let result =
+        open_responses_proxy_request_with_settings(request, without_default).await.unwrap();
+    assert_eq!(result.status_code, 400, "未设置默认供应商时仍是 400");
+
+    let mut settings = base;
+    settings.aggregate_relay_profiles[0].model_aggregation_enabled = true;
+    settings.aggregate_relay_profiles[0].default_relay_id = settings.relay_profiles[1].id.clone();
+    let result = open_responses_proxy_request_with_settings(request, settings).await.unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, body) = default_server.await.unwrap();
+    assert_eq!(
+        body["model"], "ccs-legacy/gpt-9.9-unknown[1M]",
+        "默认供应商原样转发请求里的 model id（不做去前缀/去后缀的静默改名）"
+    );
+    other_server.abort();
+}
+
+#[tokio::test]
+async fn aggregate_live_settings_updates_preserve_selected_model_and_failover() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let settings_path = temp.path().join("settings.json");
+    let _guard = SettingsPathGuard::set(settings_path.clone());
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let mut servers = Vec::new();
+    let mut urls = Vec::new();
+    let failing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hold_next = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    for name in ["a", "b", "c"] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        urls.push(format!("http://{}/v1", listener.local_addr().unwrap()));
+        let events = events.clone();
+        let failing = failing.clone();
+        let hold_next = hold_next.clone();
+        let release = release.clone();
+        servers.push(tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                let (headers, body) = request.split_once("\r\n\r\n").unwrap();
+                let body: Value = serde_json::from_str(body).unwrap();
+                let authorization = headers.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("authorization").then(|| value.trim().to_string())
+                });
+                events.send((name, body["model"].as_str().unwrap().to_string(), authorization)).unwrap();
+                if name == "b" && hold_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    release.notified().await;
+                }
+                let response = if name == "c" && failing.load(std::sync::atomic::Ordering::SeqCst) {
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 2\r\nconnection: close\r\ncontent-type: application/json\r\n\r\n{}"
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\ncontent-type: application/json\r\n\r\n{}"
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        }));
+    }
+    let mut settings = aggregate_proxy_settings("live-settings", urls[0].clone(), urls[1].clone());
+    for (index, relay) in settings.relay_profiles.iter_mut().take(2).enumerate() {
+        relay.relay_mode = RelayMode::MixedApi;
+        relay.model = format!("model-{index}");
+        relay.model_list = relay.model.clone();
+    }
+    settings.aggregate_relay_profiles[0].strategy = AggregateRelayStrategy::Failover;
+    settings.aggregate_relay_profiles[0].model_aggregation_enabled = true;
+    let first_id = settings.relay_profiles[0].id.clone();
+    let second_id = settings.relay_profiles[1].id.clone();
+    settings.aggregate_relay_profiles[0].default_relay_id = first_id.clone();
+
+    // 每次均走实际文件读取入口，保持同一代理运行时、同一会话标识。
+    fn persist(path: &Path, settings: &BackendSettings) {
+        let mut stored = settings.clone();
+        for relay in stored.relay_profiles.iter_mut().take(2) {
+            // model / URL / Key 扁平字段不参与序列化；使用真实存储快照格式。
+            relay.config_contents = format!(
+                "model = {:?}\nmodel_provider = \"custom\"\n[model_providers.custom]\nname = \"mock\"\nbase_url = {:?}\nwire_api = \"responses\"\n",
+                relay.model, relay.base_url,
+            );
+            relay.auth_contents = json!({"OPENAI_API_KEY": relay.api_key}).to_string();
+        }
+        std::fs::write(path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    }
+    async fn request(path: &Path, settings: &BackendSettings, model: &str) -> u16 {
+        persist(path, settings);
+        let body = json!({"model": model, "input": "hi", "stream": false,
+            "conversation_id": "same-live-session"}).to_string();
+        let mut response = open_responses_proxy_request(&body, None).await.unwrap();
+        let status = response.status_code;
+        let body = response.read_body().await.unwrap();
+        if status != 200 {
+            eprintln!("mock request status {status}: {}", String::from_utf8_lossy(&body));
+        }
+        status
+    }
+    macro_rules! expect {
+        ($model:expr, $target:expr, $upstream_model:expr, $key:expr) => {{
+            assert_eq!(request(&settings_path, &settings, $model).await, 200);
+            let event = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await.unwrap().unwrap();
+            assert_eq!(event, ($target, $upstream_model.to_string(), Some($key.to_string())));
+            assert!(received.try_recv().is_err(), "不能产生额外上游请求");
+        }};
+    }
+    let first_model = format!("cpx-{first_id}/model-0");
+    let second_model = format!("cpx-{second_id}/model-1");
+    expect!(&first_model, "a", "model-0", "Bearer sk-first");
+    // 只改成员 URL / Key，下次请求即采用新值。
+    settings.relay_profiles[0].base_url = urls[2].clone();
+    settings.relay_profiles[0].api_key = "synthetic-new-key".to_string();
+    expect!(&first_model, "c", "model-0", "Bearer synthetic-new-key");
+    // 重设默认成员不改派已经明确选择的成员模型。
+    settings.aggregate_relay_profiles[0].default_relay_id = second_id.clone();
+    expect!(&first_model, "c", "model-0", "Bearer synthetic-new-key");
+    expect!("model-1", "b", "model-1", "Bearer sk-second");
+    // 重设成员默认模型不覆盖本次显式选择。
+    settings.relay_profiles[0].model = "new-default".to_string();
+    settings.relay_profiles[0].model_list = "model-0,new-default".to_string();
+    expect!(&first_model, "c", "model-0", "Bearer synthetic-new-key");
+    // 移除成员只使其模型失效；不能静默改派给默认成员。
+    settings.aggregate_relay_profiles[0].members.remove(0);
+    assert_eq!(request(&settings_path, &settings, &first_model).await, 400);
+    assert!(received.try_recv().is_err());
+    expect!(&second_model, "b", "model-1", "Bearer sk-second");
+    settings.aggregate_relay_profiles[0].members.insert(0, AggregateRelayMember {
+        relay_id: first_id, weight: 1,
+    });
+    expect!(&first_model, "c", "model-0", "Bearer synthetic-new-key");
+
+    // 关闭按模型聚合后，故障转移遵循成员默认模型，并按新成员列表即时生效。
+    settings.aggregate_relay_profiles[0].model_aggregation_enabled = false;
+    failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(request(&settings_path, &settings, "client-model").await, 200);
+    assert_eq!(received.recv().await.unwrap(),
+        ("c", "new-default".to_string(), Some("Bearer synthetic-new-key".to_string())));
+    assert_eq!(received.recv().await.unwrap(),
+        ("b", "model-1".to_string(), Some("Bearer sk-second".to_string())));
+    assert!(received.try_recv().is_err());
+    settings.aggregate_relay_profiles[0].members.remove(0);
+    expect!("client-model", "b", "model-1", "Bearer sk-second");
+    // 保存设置不能中断已经发出的请求；新地址 / Key 从下一次请求起生效。
+    hold_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    let old_settings = settings.clone();
+    let old_path = settings_path.clone();
+    let in_flight = tokio::spawn(async move { request(&old_path, &old_settings, "client-model").await });
+    let event = tokio::time::timeout(Duration::from_secs(2), received.recv()).await.unwrap().unwrap();
+    assert_eq!(event, ("b", "model-1".to_string(), Some("Bearer sk-second".to_string())));
+    settings.relay_profiles[1].base_url = urls[0].clone();
+    settings.relay_profiles[1].api_key = "synthetic-next-key".to_string();
+    settings.relay_profiles[1].model = "next-default-model".to_string();
+    persist(&settings_path, &settings);
+    release.notify_one();
+    assert_eq!(in_flight.await.unwrap(), 200);
+    expect!("client-model", "a", "next-default-model", "Bearer synthetic-next-key");
+    for server in servers {
+        server.abort();
+    }
+}
+
 async fn respond_once(listener: tokio::net::TcpListener, response: &'static str) {
     let (mut stream, _) = listener.accept().await.unwrap();
     let mut buffer = [0; 1024];
@@ -3694,6 +5664,38 @@ async fn capture_request_and_respond_once(
     let request = String::from_utf8_lossy(&buffer[..read]).to_string();
     stream.write_all(response.as_bytes()).await.unwrap();
     request
+}
+
+/// 从已接受的连接读完整请求（头 + content-length 指定的 body）。
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+    let mut buffer = Vec::new();
+    let mut chunk = [0; 4096];
+    let (header_end, content_length) = loop {
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(read > 0, "request closed before headers completed");
+        buffer.extend_from_slice(&chunk[..read]);
+        let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+            })
+            .unwrap_or(0);
+        break (header_end + 4, content_length);
+    };
+    while buffer.len() < header_end + content_length {
+        let read = stream.read(&mut chunk).await.unwrap();
+        assert!(read > 0, "request closed before body completed");
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8_lossy(&buffer).to_string()
 }
 
 async fn capture_json_request_once(
@@ -3821,6 +5823,7 @@ fn aggregate_proxy_settings(
             id: aggregate_id,
             name: "aggregate".to_string(),
             session_provider: RelaySessionProvider::Custom,
+            model_aggregation_enabled: false,
             strategy: AggregateRelayStrategy::RequestRoundRobin,
             members: vec![
                 AggregateRelayMember {
@@ -3833,10 +5836,50 @@ fn aggregate_proxy_settings(
                 },
             ],
             routes: Vec::new(),
+            default_relay_id: String::new(),
+            sync_default_member_login: false,
         }],
         ..BackendSettings::default()
     }
 }
+
+#[tokio::test]
+async fn aggregate_request_build_error_still_fails_over_with_and_without_exec() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    for with_exec in [false, true] {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "status": "completed", "output": []
+            })))
+            .mount(&server)
+            .await;
+        let settings = aggregate_proxy_settings(
+            &format!("build-error-{with_exec}"),
+            "not-a-url".to_string(),
+            format!("{}/v1", server.uri()),
+        );
+        let mut request = json!({"model": "native-model", "stream": false, "input": "hello"});
+        if with_exec {
+            request["tools"] = json!([{"type": "custom", "name": "exec"}]);
+        }
+        let upstream = open_responses_proxy_request_with_settings_for_path(
+            &request.to_string(),
+            settings,
+            "/v1/responses",
+        )
+        .await
+        .expect("request build errors must participate in ordinary failover");
+        assert_eq!(upstream.status_code, 200);
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(
+            received[0].body_json::<Value>().unwrap()["tools"],
+            request["tools"]
+        );
+    }
+}
+
 #[tokio::test]
 async fn audio_transcriptions_proxy_forwards_multipart_body() {
     let _lock = settings_path_test_lock().lock().unwrap();
@@ -3931,14 +5974,14 @@ async fn image_generations_proxy_forwards_json_and_upstream_error() {
     });
     write_image_relay_settings(temp.path(), &format!("http://{addr}/v1"));
     let body = br#"{"model":"gpt-image-2","prompt":"draw a square"}"#;
-    let upstream = open_image_generations_proxy_request(body, Some("Image-Client/1.0"))
+    let mut upstream = open_image_generations_proxy_request(body, Some("Image-Client/1.0"))
         .await
         .unwrap();
     assert_eq!(upstream.status_code, 429);
     assert_eq!(upstream.content_type, "application/problem+json");
     assert_eq!(
-        upstream.response.bytes().await.unwrap().as_ref(),
-        br#"{"error":{"message":"rate limited"}}"#
+        upstream.read_body().await.unwrap(),
+        br#"{"error":{"message":"rate limited"}}"#.to_vec()
     );
     let request = server.await.unwrap();
     let header_end = find_http_header_end(&request).unwrap();
@@ -4003,6 +6046,122 @@ async fn image_edits_proxy_preserves_multipart_body_and_content_type() {
     assert_eq!(&request[header_end + 4..], body.as_slice());
 }
 
+/// 官方登录成员的生图请求：Codex CLI 的 imagegen 扩展按 provider base_url 拼
+/// `images/generations`；聚合代理要像 /responses、/models 一样用 OAuth 凭据
+/// 转发到 chatgpt.com 后端，不能因为成员是官方登录就直接拒绝。
+#[tokio::test]
+async fn image_generations_for_official_login_member_uses_oauth_backend() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    let _codex_home = EnvVarGuard::set("CODEX_HOME", temp.path().to_str().unwrap());
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_request_with_response(
+        listener,
+        "application/json",
+        r#"{"created":1,"data":[{"b64_json":"AAAA"}]}"#.to_string(),
+    ));
+    let _env_guard = EnvVarGuard::set(
+        "CODEX_PLUS_OFFICIAL_BASE_URL",
+        &format!("http://{address}/backend-api/codex"),
+    );
+    write_official_image_relay_settings(temp.path());
+
+    let body = br#"{"model":"gpt-image-2","prompt":"draw a square"}"#;
+    let mut upstream = open_image_generations_proxy_request(body, Some("Image-Client/1.0"))
+        .await
+        .unwrap();
+    assert_eq!(upstream.status_code, 200);
+    assert_eq!(
+        upstream.read_body().await.unwrap(),
+        br#"{"created":1,"data":[{"b64_json":"AAAA"}]}"#.to_vec()
+    );
+
+    let (headers, sent) = server.await.unwrap();
+    let headers_lower = headers.to_ascii_lowercase();
+    assert!(
+        headers.starts_with("POST /backend-api/codex/images/generations HTTP/1.1"),
+        "{headers}"
+    );
+    assert!(
+        headers_lower.contains("authorization: bearer official-access"),
+        "{headers}"
+    );
+    assert!(
+        headers_lower.contains("chatgpt-account-id: acct-official"),
+        "{headers}"
+    );
+    assert!(
+        headers_lower.contains("originator: codex_cli_rs"),
+        "{headers}"
+    );
+    assert_eq!(
+        sent,
+        json!({"model":"gpt-image-2","prompt":"draw a square"})
+    );
+}
+
+/// 编辑接口走同一条官方登录通道，路径是 `images/edits`，请求体原样透传。
+#[tokio::test]
+async fn image_edits_for_official_login_member_uses_oauth_backend() {
+    let _lock = settings_path_test_lock().lock().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
+    let _codex_home = EnvVarGuard::set("CODEX_HOME", temp.path().to_str().unwrap());
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_request_with_response(
+        listener,
+        "application/json",
+        r#"{"created":2,"data":[{"b64_json":"BBBB"}]}"#.to_string(),
+    ));
+    let _env_guard = EnvVarGuard::set(
+        "CODEX_PLUS_OFFICIAL_BASE_URL",
+        &format!("http://{address}/backend-api/codex"),
+    );
+    write_official_image_relay_settings(temp.path());
+
+    let body = br#"{"images":[{"image_url":"data:image/png;base64,AAAA"}],"model":"gpt-image-2","prompt":"make it blue"}"#;
+    let mut upstream = open_image_edits_proxy_request(body, "application/json", None)
+        .await
+        .unwrap();
+    assert_eq!(upstream.status_code, 200);
+    assert_eq!(
+        upstream.read_body().await.unwrap(),
+        br#"{"created":2,"data":[{"b64_json":"BBBB"}]}"#.to_vec()
+    );
+
+    let (headers, sent) = server.await.unwrap();
+    let headers_lower = headers.to_ascii_lowercase();
+    assert!(
+        headers.starts_with("POST /backend-api/codex/images/edits HTTP/1.1"),
+        "{headers}"
+    );
+    assert!(
+        headers_lower.contains("authorization: bearer official-access"),
+        "{headers}"
+    );
+    assert!(
+        headers_lower.contains("chatgpt-account-id: acct-official"),
+        "{headers}"
+    );
+    assert_eq!(
+        sent,
+        json!({
+            "images":[{"image_url":"data:image/png;base64,AAAA"}],
+            "model":"gpt-image-2",
+            "prompt":"make it blue"
+        })
+    );
+}
+
 #[tokio::test]
 async fn chat_completions_proxy_uses_configured_user_agent() {
     let _lock = settings_path_test_lock().lock().unwrap();
@@ -4061,6 +6220,208 @@ async fn responses_proxy_passes_through_original_user_agent_when_unconfigured() 
 
     let request = server.finish();
     assert_eq!(request.user_agent, "Original-Codex-UA/1.0");
+}
+
+fn captured_header_values<'a>(headers: &'a str, expected_name: &str) -> Vec<&'a str> {
+    headers
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(expected_name)
+                .then(|| value.trim())
+        })
+        .collect()
+}
+
+fn session_header_settings(protocol: RelayProtocol, base_url: String) -> BackendSettings {
+    BackendSettings {
+        relay_profiles_enabled: true,
+        active_relay_id: "session-headers".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "session-headers".to_string(),
+            base_url,
+            api_key: "sk-upstream".to_string(),
+            protocol,
+            relay_mode: RelayMode::PureApi,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    }
+}
+
+#[tokio::test]
+async fn responses_proxy_preserves_session_headers_through_both_protocols() {
+    for protocol in [RelayProtocol::Responses, RelayProtocol::ChatCompletions] {
+        // 连续两次请求携带不同的客户端会话，不能混成供应商级固定值。
+        for (session_id, thread_id, opencode_session) in [
+            ("session-a", "thread-a", "opencode-a"),
+            ("session-b", "thread-b", "opencode-b"),
+        ] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(capture_request_with_response(
+                listener,
+                "application/json",
+                "{}".to_string(),
+            ));
+            let settings = session_header_settings(protocol, format!("http://{address}/v1"));
+            let result = open_responses_proxy_request_with_settings_for_path_and_session_headers(
+                r#"{"model":"session-probe","input":"hello","stream":false}"#,
+                settings,
+                "/v1/responses",
+                Some("remote_compaction_v2"),
+                ProxySessionHeaders {
+                    session_id: Some(session_id),
+                    thread_id: Some(thread_id),
+                    opencode_session: Some(opencode_session),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.status_code, 200);
+            let (headers, _) = server.await.unwrap();
+            let endpoint = if protocol == RelayProtocol::Responses {
+                "/v1/responses"
+            } else {
+                "/v1/chat/completions"
+            };
+            assert!(headers.starts_with(&format!("POST {endpoint} HTTP/1.1")));
+            assert_eq!(
+                captured_header_values(&headers, "session-id"),
+                vec![session_id]
+            );
+            assert_eq!(
+                captured_header_values(&headers, "thread-id"),
+                vec![thread_id]
+            );
+            assert_eq!(
+                captured_header_values(&headers, "x-opencode-session"),
+                vec![opencode_session]
+            );
+            assert_eq!(
+                captured_header_values(&headers, "authorization"),
+                vec!["Bearer sk-upstream"]
+            );
+            assert_eq!(
+                captured_header_values(&headers, "x-codex-beta-features"),
+                if protocol == RelayProtocol::Responses {
+                    vec!["remote_compaction_v2"]
+                } else {
+                    vec![]
+                },
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_proxy_session_headers_keep_custom_headers_authoritative() {
+    for protocol in [RelayProtocol::Responses, RelayProtocol::ChatCompletions] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(capture_request_with_response(
+            listener,
+            "application/json",
+            "{}".to_string(),
+        ));
+        let mut settings = session_header_settings(protocol, format!("http://{address}/v1"));
+        let relay = &mut settings.relay_profiles[0];
+        relay.custom_headers = vec![
+            codex_plus_core::settings::RelayHeaderKeyValue {
+                key: "Session-ID".to_string(),
+                value: "configured-session".to_string(),
+            },
+            codex_plus_core::settings::RelayHeaderKeyValue {
+                key: "THREAD-id".to_string(),
+                value: "configured-thread".to_string(),
+            },
+            codex_plus_core::settings::RelayHeaderKeyValue {
+                key: "X-OpenCode-Session".to_string(),
+                value: String::new(),
+            },
+        ];
+        let result = open_responses_proxy_request_with_settings_for_path_and_session_headers(
+            r#"{"model":"session-probe","input":"hello","stream":false}"#,
+            settings,
+            "/v1/responses",
+            None,
+            ProxySessionHeaders {
+                session_id: Some("client-session"),
+                thread_id: Some("client-thread"),
+                opencode_session: Some("client-opencode"),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status_code, 200);
+        let (headers, _) = server.await.unwrap();
+        assert_eq!(
+            captured_header_values(&headers, "session-id"),
+            vec!["configured-session"]
+        );
+        assert_eq!(
+            captured_header_values(&headers, "thread-id"),
+            vec!["configured-thread"]
+        );
+        assert_eq!(
+            captured_header_values(&headers, "x-opencode-session"),
+            vec![""]
+        );
+        assert!(!headers.contains("client-"));
+    }
+}
+
+#[tokio::test]
+async fn responses_proxy_omits_empty_or_invalid_session_headers_and_keeps_legacy_api() {
+    for legacy_api in [false, true] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(capture_request_with_response(
+            listener,
+            "application/json",
+            "{}".to_string(),
+        ));
+        let settings =
+            session_header_settings(RelayProtocol::Responses, format!("http://{address}/v1"));
+        let body = r#"{"model":"session-probe","input":"hello","stream":false}"#;
+        let result = if legacy_api {
+            open_responses_proxy_request_with_settings_for_path(body, settings, "/v1/responses")
+                .await
+        } else {
+            open_responses_proxy_request_with_settings_for_path_and_session_headers(
+                body,
+                settings,
+                "/v1/responses",
+                None,
+                ProxySessionHeaders {
+                    session_id: Some("   "),
+                    thread_id: Some("invalid\r\nx-injected: value"),
+                    opencode_session: None,
+                },
+            )
+            .await
+        }
+        .unwrap();
+        assert_eq!(result.status_code, 200);
+        let (headers, _) = server.await.unwrap();
+        for name in [
+            "session-id",
+            "thread-id",
+            "x-opencode-session",
+            "x-injected",
+        ] {
+            assert!(
+                captured_header_values(&headers, name).is_empty(),
+                "unexpected header: {name}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -4182,6 +6543,31 @@ fn write_image_relay_settings(settings_dir: &Path, upstream_base_url: &str) {
     .unwrap();
 }
 
+fn write_official_image_relay_settings(settings_dir: &Path) {
+    let settings = json!({
+        "relayProfiles": [{
+            "id": "official-image",
+            "name": "官方登录",
+            "relayMode": "official",
+            "protocol": "responses",
+            "authContents": json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "official-access",
+                    "refresh_token": "official-refresh",
+                    "account_id": "acct-official"
+                }
+            }).to_string()
+        }],
+        "activeRelayId": "official-image"
+    });
+    std::fs::write(
+        settings_dir.join("settings.json"),
+        serde_json::to_vec_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+}
+
 fn write_no_auth_relay_settings(settings_dir: &Path, base_url: &str, protocol: &str) {
     let settings = json!({
         "relayProfiles": [{
@@ -4205,6 +6591,34 @@ fn write_no_auth_relay_settings(settings_dir: &Path, base_url: &str, protocol: &
 
 struct SettingsPathGuard {
     previous: Option<PathBuf>,
+}
+
+/// 官方登录相关地址的测试覆盖（生产默认 chatgpt.com / auth.openai.com）。
+/// 这些环境变量只影响官方登录成员，测试内串行使用。
+struct EnvVarGuard {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(name);
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
 }
 
 fn settings_path_test_lock() -> &'static Mutex<()> {
@@ -5207,7 +7621,7 @@ async fn native_compaction_preserves_protocol_and_opaque_state() {
                 });
                 let settings =
                     model_route_settings("gpt-5.6-luna", "", format!("http://{address}/v1"));
-                let result = open_responses_proxy_request_with_settings_for_path_and_beta(
+                let mut result = open_responses_proxy_request_with_settings_for_path_and_beta(
                     &request.to_string(),
                     settings,
                     "/v1/responses",
@@ -5219,7 +7633,10 @@ async fn native_compaction_preserves_protocol_and_opaque_state() {
                     !result.compaction,
                     "native Responses must not enter the synthetic wrapper"
                 );
-                assert_eq!(result.response.text().await.unwrap(), expected_response);
+                assert_eq!(
+                    String::from_utf8(result.read_body().await.unwrap()).unwrap(),
+                    expected_response
+                );
                 let (headers, sent) = server.await.unwrap();
                 assert!(headers.starts_with("POST /v1/responses HTTP/1.1"));
                 assert_eq!(
@@ -5237,4 +7654,926 @@ async fn native_compaction_preserves_protocol_and_opaque_state() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 协议代理自动重试：上游瞬时失败在本地代理内部消化，不把失败交给 Codex。
+// ---------------------------------------------------------------------------
+
+/// 单供应商直连设置：非聚合路径下 relays 只有一个候选，重试只会打同一个上游。
+fn single_relay_proxy_settings(base_url: &str) -> BackendSettings {
+    let relay_id = format!(
+        "auto-retry-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    BackendSettings {
+        active_relay_id: relay_id.clone(),
+        relay_profiles: vec![RelayProfile {
+            id: relay_id,
+            name: "auto retry relay".to_string(),
+            protocol: RelayProtocol::Responses,
+            base_url: base_url.to_string(),
+            api_key: "sk-auto-retry".to_string(),
+            relay_mode: RelayMode::PureApi,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    }
+}
+
+fn proxy_http_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+async fn serve_scripted_responses(
+    listener: tokio::net::TcpListener,
+    responses: Vec<String>,
+) -> Vec<String> {
+    let mut requests = Vec::new();
+    for response in responses {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        requests.push(read_http_request(&mut stream).await);
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+    requests
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_does_not_retry_http_status_errors() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    // 即便 body 文案写得像容量错误，默认（未勾选任何状态码）HTTP 非 2xx 也不重试：
+    // 只重试 200 流内 response.failed 的 server_overloaded。
+    let responses = vec![proxy_http_response(
+        "429 Too Many Requests",
+        r#"{"error":{"message":"Selected model is at capacity. Please try a different model."}}"#,
+    )];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-luna","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 429, "非容量流错误应原样返回");
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 1);
+    assert_eq!(trace.auto_retries, 0);
+    assert!(result.read_body().await.unwrap().windows(8).any(|w| w == b"capacity"));
+    assert_eq!(server.await.unwrap().len(), 1, "429 不应触发自动重试");
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_does_not_retry_http_5xx_errors() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![proxy_http_response(
+        "503 Service Unavailable",
+        r#"{"error":{"message":"upstream unavailable"}}"#,
+    )];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-luna","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 503);
+    assert_eq!(server.await.unwrap().len(), 1, "5xx 不应触发自动重试");
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_can_be_disabled() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![proxy_http_response(
+        "429 Too Many Requests",
+        r#"{"error":{"message":"rate limited"}}"#,
+    )];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry = false;
+    settings.protocol_proxy_auto_retry_max_attempts = 5;
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-luna","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 429);
+    assert_eq!(server.await.unwrap().len(), 1, "关闭后不得自动重试");
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_does_not_retry_client_errors() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![proxy_http_response(
+        "400 Bad Request",
+        r#"{"error":{"message":"invalid request"}}"#,
+    )];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-luna","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 400);
+    assert_eq!(server.await.unwrap().len(), 1, "400 不应触发自动重试");
+}
+
+// ---------------------------------------------------------------------------
+// 用户勾选的 HTTP 状态码（issue #2653）：默认空列表不重试，勾选后由代理退避重发。
+// ---------------------------------------------------------------------------
+
+fn proxy_http_response_with_retry_after(status: &str, retry_after: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nretry-after: {retry_after}\r\ncontent-length: {}\r\ncontent-type: application/json\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_retries_opted_in_status_and_honors_retry_after() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![
+        proxy_http_response_with_retry_after(
+            "429 Too Many Requests",
+            "1",
+            r#"{"error":{"message":"rate limited","code":"rate_limit_exceeded"}}"#,
+        ),
+        proxy_sse_response(&success_stream()),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+    settings.protocol_proxy_auto_retry_status_codes = vec![429];
+
+    let started = Instant::now();
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 200);
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    assert_eq!(trace.retry_reasons, vec!["upstream_http_status:429".to_string()]);
+    assert_eq!(trace.attempt_details.len(), 1);
+    let detail = &trace.attempt_details[0];
+    assert_eq!(detail.attempt, 1);
+    assert_eq!(detail.code.as_deref(), Some("rate_limit_exceeded"));
+    assert_eq!(detail.message.as_deref(), Some("rate limited"));
+    // Retry-After: 1 优先于 0 秒的设置间隔（地板 250ms）。
+    assert_eq!(detail.delay_ms, Some(1000));
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("resp_ok"));
+    assert!(!body.contains("rate limited"), "重试成功后不能把 429 交给 Codex");
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_skips_status_codes_not_opted_in() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![proxy_http_response(
+        "503 Service Unavailable",
+        r#"{"error":{"message":"upstream unavailable"}}"#,
+    )];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+    settings.protocol_proxy_auto_retry_status_codes = vec![429];
+
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-luna","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 503);
+    assert_eq!(server.await.unwrap().len(), 1, "未勾选的状态码不应重试");
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_returns_last_status_body_when_budget_is_exhausted() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![
+        proxy_http_response("429 Too Many Requests", r#"{"error":{"message":"first"}}"#),
+        proxy_http_response("429 Too Many Requests", r#"{"error":{"message":"still limited"}}"#),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 1;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+    settings.protocol_proxy_auto_retry_status_codes = vec![429, 503];
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-5.6-luna","input":"hi","stream":false}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 429);
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    // 预算用尽时最后一次的错误体必须完整交给 Codex，不能因预读而丢失。
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("still limited"), "{body}");
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// 200 流内 response.failed（官方 server_overloaded/capacity）也要先由代理重试。
+// ---------------------------------------------------------------------------
+
+fn proxy_sse_response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: text/event-stream\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn capacity_failed_stream() -> String {
+    concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_capacity\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.in_progress\n",
+        "data: {\"type\":\"response.in_progress\"}\n\n",
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_capacity\",\"status\":\"failed\",\"error\":{\"code\":\"server_overloaded\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}}\n\n",
+    )
+    .to_string()
+}
+
+fn success_stream() -> String {
+    concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_ok\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"status\":\"completed\"}}\n\n",
+    )
+    .to_string()
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_recovers_from_capacity_error_inside_200_stream() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![
+        proxy_sse_response(&capacity_failed_stream()),
+        proxy_sse_response(&success_stream()),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+
+    let started = Instant::now();
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 200);
+    assert!(result.is_stream);
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    assert_eq!(
+        trace.retry_reasons,
+        vec!["upstream_stream_failed:server_overloaded".to_string()]
+    );
+    // 重试明细：第 1 次尝试因 server_overloaded 失败，记录根因与退避。
+    assert_eq!(trace.attempt_details.len(), 1);
+    let detail = &trace.attempt_details[0];
+    assert_eq!(detail.attempt, 1);
+    assert_eq!(detail.code.as_deref(), Some("server_overloaded"));
+    assert!(detail.delay_ms.is_some_and(|delay| delay >= 250));
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("resp_ok"));
+    assert!(
+        !body.contains("server_overloaded"),
+        "容量失败不能在已经重试成功的情况下泄露给 Codex"
+    );
+    assert_eq!(server.await.unwrap().len(), 2, "应在 200 流内失败后重发一次");
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "流内重试也要有最小退避"
+    );
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_does_not_retry_after_commit_with_zero_delay() {
+    // 首字提交延迟显式设为 0：正文一出现就提交，回到旧行为，之后的过载只能
+    // 交给 Codex 原生重试，代理不得再重放流。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let failed_after_output = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_overloaded\",\"message\":\"Selected model is at capacity.\"}}}\n\n",
+    );
+    let responses = vec![proxy_sse_response(failed_after_output)];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+    settings.protocol_proxy_auto_retry_commit_delay_ms = 0;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("partial"));
+    assert!(body.contains("server_overloaded"));
+    assert_eq!(server.await.unwrap().len(), 1, "已经写出输出后不能再重放流");
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_recovers_from_overload_during_tool_arguments() {
+    // 工具调用参数阶段不可见，整项缓冲到 output_item.done 才提交；中途过载
+    // 可以整体丢弃重发，Codex 不会看到被丢弃的 partial 参数。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let overloaded_tool_arguments = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"name\":\"shell\",\"arguments\":\"\"}}\n\n",
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"command\\\":\"}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
+    );
+    let responses = vec![
+        proxy_sse_response(overloaded_tool_arguments),
+        proxy_sse_response(&success_stream()),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 2;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+    // 显式 0 宽限：证明工具调用参数阶段不依赖首字提交延迟也会被整项缓冲。
+    settings.protocol_proxy_auto_retry_commit_delay_ms = 0;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("resp_ok"));
+    assert!(
+        !body.contains("server_is_overloaded"),
+        "工具参数阶段的过载不应泄露给 Codex"
+    );
+    assert_eq!(server.await.unwrap().len(), 2, "工具参数中途过载应整轮重发");
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_recovers_from_overload_within_first_output_grace() {
+    // 首段正文已经输出，但仍处在「首字提交延迟」窗口内：代理还能丢弃重试。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let overloaded_after_first_text = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_grace\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
+        "event: response.content_part.added\n",
+        "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_overloaded\",\"message\":\"Selected model is at capacity.\"}}}\n\n",
+    );
+    let responses = vec![
+        proxy_sse_response(overloaded_after_first_text),
+        proxy_sse_response(&success_stream()),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 2;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+    // 宽限设得足够长，证明重试发生在宽限内、且不依赖窗口到期。
+    settings.protocol_proxy_auto_retry_commit_delay_ms = 5_000;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("resp_ok"));
+    assert!(
+        !body.contains("partial"),
+        "被丢弃的首段正文不应泄露给 Codex"
+    );
+    assert!(!body.contains("server_overloaded"));
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_does_not_retry_after_commit_delay_elapsed() {
+    // 首段正文出现后，上游沉默超过提交延迟：代理在宽限到期时提交，
+    // 之后的过载只能交给 Codex 原生重试。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let first_part = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_late\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
+        "event: response.content_part.added\n",
+        "data: {\"type\":\"response.content_part.added\",\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+    );
+    let second_part = concat!(
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"server_overloaded\",\"message\":\"Selected model is at capacity.\"}}}\n\n",
+    );
+    let total_len = first_part.len() + second_part.len();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {total_len}\r\ncontent-type: text/event-stream\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        stream.write_all(first_part.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        // 比提交延迟（100ms）更晚才发过载事件。
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        stream.write_all(second_part.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        vec![request]
+    });
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 2;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+    settings.protocol_proxy_auto_retry_commit_delay_ms = 100;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 1, "提交之后不应再重试");
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("partial"));
+    assert!(body.contains("server_overloaded"), "{body}");
+    assert_eq!(server.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_short_reply_commits_on_completion_without_full_grace_wait() {
+    // 短回复在 response.completed 到达时立即提交，不白等满首字提交延迟。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![proxy_sse_response(&success_stream())];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 2;
+    // 宽限放大到 20 秒：如果实现傻等窗口，下面的断言会因超时而失败。
+    settings.protocol_proxy_auto_retry_commit_delay_ms = 20_000;
+
+    let started = Instant::now();
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("resp_ok"));
+    assert_eq!(server.await.unwrap().len(), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "response.completed 应立即提交，不应等满 20 秒宽限"
+    );
+}
+
+#[tokio::test]
+async fn legacy_streaming_mode_keeps_old_immediate_commit() {
+    // 旧「流式避震」行为保留为独立模式：工具调用参数一开始输出就提交，
+    // 之后的过载交给 Codex，代理不再重试。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let overloaded_tool_arguments = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_legacy\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"name\":\"shell\",\"arguments\":\"\"}}\n\n",
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"command\\\":\"}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
+    );
+    let responses = vec![proxy_sse_response(overloaded_tool_arguments)];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 2;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+    settings.protocol_proxy_auto_retry_mode = "streaming-legacy".to_string();
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 1, "旧模式不应再重放已经开始输出的流");
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("server_is_overloaded"), "{body}");
+    assert_eq!(server.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn failed_after_visible_output_keeps_first_token_timing() {
+    // 首段正文已缓冲但未提交时遇到不可重试的终态失败：不重试、把前缀交回
+    // Codex，同时保留真实的首字时间（不能记成提交时刻）。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let visible_then_permanent_failure = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bad_after_text\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}}\n\n",
+    );
+    let responses = vec![proxy_sse_response(visible_then_permanent_failure)];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 1);
+    assert!(
+        trace.first_output_at_ms.is_some(),
+        "可见输出之后失败也要保留首字时间"
+    );
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("partial"));
+    assert!(body.contains("invalid_request_error"), "{body}");
+    assert_eq!(server.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn retry_budget_exhausted_commits_without_waiting_grace() {
+    // 第一次尝试失败并重试后预算用尽：第二次尝试不再为首字白等宽限窗口。
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let first_part = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_budget\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+    );
+    // content-length 故意大于实际发送的字节，且连接保持 12 秒不结束：
+    // 宽限若生效，预读必须等满窗口；预算耗尽退回旧时机则会立即提交。
+    let declared_len = first_part.len() + 128;
+    let first_attempt_failure = capacity_failed_stream();
+    let server = tokio::spawn(async move {
+        // 第一次尝试：首字前过载，触发一次代理重试。
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_http_request(&mut stream).await;
+        stream
+            .write_all(proxy_sse_response(&first_attempt_failure).as_bytes())
+            .await
+            .unwrap();
+        // 第二次尝试：写出首段正文后挂住连接。
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = read_http_request(&mut stream).await;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {declared_len}\r\ncontent-type: text/event-stream\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        stream.write_all(first_part.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(12)).await;
+    });
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 1;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+    // 宽限远大于测试阈值：预算耗尽后如果不退回旧提交时机，这里会等满窗口。
+    settings.protocol_proxy_auto_retry_commit_delay_ms = 20_000;
+
+    let started = Instant::now();
+    let result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "重试预算耗尽后不应再等首字宽限窗口"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_does_not_retry_non_capacity_stream_failures() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let permanent_failure = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bad\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.failed\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"bad input\"}}}\n\n",
+    );
+    let responses = vec![proxy_sse_response(permanent_failure)];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 3;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("invalid_request_error"));
+    assert_eq!(server.await.unwrap().len(), 1, "非容量类流内失败不得重试");
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_can_be_disabled_for_stream_failures() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![proxy_sse_response(&capacity_failed_stream())];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry = false;
+    settings.protocol_proxy_auto_retry_max_attempts = 5;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("server_overloaded"));
+    assert_eq!(server.await.unwrap().len(), 1, "关闭后不得重试流内失败");
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_recovers_from_server_is_overloaded_error_event() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let overloaded = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_overloaded\",\"status\":\"in_progress\"}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
+    );
+    let responses = vec![
+        proxy_sse_response(overloaded),
+        proxy_sse_response(&success_stream()),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 2;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+
+    let started = Instant::now();
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 200);
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("resp_ok"));
+    assert!(!body.contains("server_is_overloaded"), "重试成功后不应泄露失败事件");
+    assert_eq!(server.await.unwrap().len(), 2);
+    assert!(started.elapsed() >= Duration::from_millis(200));
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_stream_stops_after_configured_attempts() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![
+        proxy_sse_response(&capacity_failed_stream()),
+        proxy_sse_response(&capacity_failed_stream()),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 1;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 200);
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("server_overloaded"), "预算用尽后应把失败流交给 Codex");
+    assert_eq!(server.await.unwrap().len(), 2, "max attempts=1 表示只额外重试一次");
+}
+
+#[tokio::test]
+async fn proxy_auto_retry_recovers_from_overload_during_reasoning() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let overloaded_during_reasoning = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_reasoning\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
+        "event: response.reasoning_summary_text.delta\n",
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking...\"}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}\n\n",
+    );
+    let responses = vec![
+        proxy_sse_response(overloaded_during_reasoning),
+        proxy_sse_response(&success_stream()),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_max_attempts = 2;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+
+    let started = Instant::now();
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    assert_eq!(
+        trace.retry_reasons,
+        vec!["upstream_stream_failed:server_is_overloaded".to_string()]
+    );
+    assert_eq!(trace.attempt_details.len(), 1);
+    assert_eq!(trace.attempt_details[0].attempt, 1);
+    assert_eq!(
+        trace.attempt_details[0].code.as_deref(),
+        Some("server_is_overloaded")
+    );
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("resp_ok"));
+    assert!(!body.contains("server_is_overloaded"), "推理阶段失败不应泄露给 Codex");
+    assert_eq!(server.await.unwrap().len(), 2);
+    assert!(started.elapsed() >= Duration::from_millis(200));
+}
+
+#[tokio::test]
+async fn buffered_mode_retries_overload_and_returns_complete_stream() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let responses = vec![
+        proxy_sse_response(&capacity_failed_stream()),
+        proxy_sse_response(&success_stream()),
+    ];
+    let server = tokio::spawn(serve_scripted_responses(listener, responses));
+
+    let mut settings = single_relay_proxy_settings(&format!("http://{address}/v1"));
+    settings.protocol_proxy_auto_retry_mode = "buffered".to_string();
+    settings.protocol_proxy_auto_retry_max_attempts = 2;
+    settings.protocol_proxy_auto_retry_interval_seconds = 0;
+
+    let mut result = open_responses_proxy_request_with_settings(
+        r#"{"model":"gpt-6.1-sol","input":"hi","stream":true}"#,
+        settings,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.status_code, 200);
+    assert!(result.is_stream);
+    assert!(result.buffered_body.is_some(), "buffered 模式应整段收齐后再返回");
+    let trace = result.request_trace.clone().expect("请求日志 trace");
+    assert_eq!(trace.attempts, 2);
+    assert_eq!(trace.auto_retries, 1);
+    let body = String::from_utf8(result.read_body().await.unwrap()).unwrap();
+    assert!(body.contains("resp_ok"));
+    assert!(!body.contains("server_overloaded"));
+    assert_eq!(server.await.unwrap().len(), 2);
 }

@@ -26,7 +26,29 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install NSIS
-        run: choco install nsis -y
+        shell: pwsh
+        run: |
+          $makensis = $null
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install nsis -y --no-progress
+            # Chocolatey 可能在下载失败后返回成功，必须实际验证编译器。
+            $candidates = @(
+              "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+              "$env:ProgramFiles\NSIS\makensis.exe"
+            )
+            $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+            if (-not $makensis) {
+              $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+              if ($command) { $makensis = $command.Source }
+            }
+            if ($makensis) {
+              & $makensis /VERSION
+              if ($LASTEXITCODE -eq 0) { break }
+            }
+            $makensis = $null
+            if ($attempt -lt 3) { Start-Sleep -Seconds (10 * $attempt) }
+          }
+          if (-not $makensis) { throw "NSIS 安装失败或编译器不可用，停止 PR 构建。" }
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
@@ -50,7 +72,7 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace
 
-      - name: Build release binaries
+      - name: Build release application
         run: cargo build --release
 
       - name: Stage Windows app files
@@ -58,7 +80,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist/windows/app | Out-Null
           Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
-          Copy-Item target/release/codex-plus-plus-manager.exe dist/windows/app/
+          if ((Get-ChildItem dist/windows/app -Filter *.exe).Count -ne 1) { throw "Windows 安装包必须只有一个应用程序。" }
 
       - name: Build Windows installer
         shell: pwsh
@@ -68,13 +90,26 @@ jobs:
           if (-not $version -or $version -eq "main") {
             $version = "0.0.0-${{ github.run_number }}"
           }
-          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
-          if (-not (Test-Path $makensis)) {
-            $makensis = "makensis"
+          # NSIS 的 64 位安装目录与 Chocolatey PATH 更新均需要兼容。
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+            "$env:ProgramFiles\NSIS\makensis.exe"
+          )
+          $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $makensis) {
+            $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+            if ($command) { $makensis = $command.Source }
+          }
+          if (-not $makensis) {
+            throw "NSIS 编译器未找到，检查 Chocolatey 安装结果。"
           }
           Push-Location scripts/installer/windows
-          & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" CodexPlusPlus.nsi
-          Pop-Location
+          try {
+            & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" CodexPlusPlus.nsi
+            if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败，退出码 $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
 
       - name: Upload Windows binaries
         uses: actions/upload-artifact@v4
@@ -91,18 +126,10 @@ jobs:
           if-no-files-found: error
 
   macos-dmg:
-    name: macOS DMG (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - arch: arm64
-            runner: macos-14
-            target: aarch64-apple-darwin
+    # PR 构建也出通用包，跟发版产物保持一致，避免只在发版时才暴露问题。
+    # 没有签名密钥，所以这里走 ad-hoc（脚本的默认行为）。
+    name: macOS DMG (universal)
+    runs-on: macos-14
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -115,7 +142,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
@@ -128,10 +155,7 @@ jobs:
         working-directory: apps/codex-plus-manager
         run: npm run vite:build
 
-      - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build macOS DMG
+      - name: Build universal macOS DMG
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           VERSION="${VERSION#V}"
@@ -139,17 +163,30 @@ jobs:
           if [ -z "$VERSION" ] || [ "$VERSION" = "main" ]; then
             VERSION="0.0.0-${GITHUB_RUN_NUMBER}"
           fi
-          BINARY_DIR="$PWD/target/${{ matrix.target }}/release" bash scripts/installer/macos/package-dmg.sh "$VERSION" "${{ matrix.arch }}"
+          # 未设置 MACOS_SIGNING_IDENTITY，脚本自动退回 ad-hoc 签名。
+          bash scripts/installer/macos/build-universal.sh "$VERSION"
 
       - name: Verify macOS bundle structure
         run: |
           set -euo pipefail
           test -L "dist/macos/stage/Applications"
           test "$(readlink "dist/macos/stage/Applications")" = "/Applications"
+          apps=(dist/macos/stage/*.app)
+          test "${#apps[@]}" = "2"
+          test -f "dist/macos/stage/.hidden"
+          grep -qx "Codex++ 管理工具.app" "dist/macos/stage/.hidden"
           for app in "dist/macos/stage/Codex++.app" "dist/macos/stage/Codex++ 管理工具.app"; do
             test -f "$app/Contents/Info.plist"
             test -f "$app/Contents/PkgInfo"
             test -x "$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+            if [[ "$app" == *"管理工具.app" ]]; then
+              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "com.bigpizzav3.codexplusplus.manager"
+              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "CodexPlusPlusManager"
+            else
+              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = "com.bigpizzav3.codexplusplus"
+              test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "CodexPlusPlus"
+            fi
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CodexPlusUnifiedApp' "$app/Contents/Info.plist")" = "true"
             plutil -lint "$app/Contents/Info.plist" >/dev/null
             codesign -dv "$app" >/dev/null 2>&1
             echo "verified: $app"
@@ -158,91 +195,68 @@ jobs:
       - name: Upload macOS DMG
         uses: actions/upload-artifact@v4
         with:
-          name: codex-plus-plus-macos-${{ matrix.arch }}-dmg
+          name: codex-plus-plus-macos-universal-dmg
           path: dist/macos/*.dmg
           if-no-files-found: error
 
   linux-deb:
-    name: Linux DEB (x64)
-    runs-on: ubuntu-latest
+    name: Linux DEB (Ubuntu 24.04, amd64)
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system dependencies
+      - name: Install Linux build dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            curl \
-            git \
-            pkg-config \
-            libssl-dev \
-            libsqlite3-dev \
-            libdbus-1-dev \
-            libglib2.0-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            libjavascriptcoregtk-4.1-dev \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev
-
-      - name: Install frontend dependencies
-        working-directory: apps/codex-plus-manager
-        run: npm ci
-
-      - name: Frontend tests
-        working-directory: apps/codex-plus-manager
-        run: npm test
-
-      - name: Check native browser inspector bundle
-        run: node scripts/assemble-native-browser-inspector.mjs --check
-
-      - name: TypeScript check
-        working-directory: apps/codex-plus-manager
-        run: npm run check
-
+            build-essential curl git pkg-config libssl-dev libsqlite3-dev \
+            libdbus-1-dev libglib2.0-dev libgtk-3-dev \
+            libayatana-appindicator3-dev libjavascriptcoregtk-4.1-dev \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev libz3-dev
       - name: Build frontend
         working-directory: apps/codex-plus-manager
-        run: npm run vite:build
-
-      - name: Rust tests
-        run: cargo test --workspace
-
-      - name: Build release binaries
-        run: cargo build --release
-
-      - name: Build Linux DEB package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          VERSION="${VERSION#V}"
-          VERSION="${VERSION//\//-}"
-          if [ -z "$VERSION" ] || [ "$VERSION" = "main" ]; then
-            VERSION="0.0.0-${GITHUB_RUN_NUMBER}"
-          fi
-          bash scripts/installer/linux/build-deb.sh --package-only "$VERSION"
-
-      - name: Verify Linux DEB structure
+          npm ci
+          npm run vite:build
+      - name: Build Linux application
+        run: cargo build --release -p codex-plus-manager
+      - name: Check default version outside repository
+        shell: bash
         run: |
           set -euo pipefail
-          deb_file=$(ls dist/linux/*.deb | head -n 1)
-          dpkg-deb -I "$deb_file"
-          dpkg-deb -c "$deb_file"
-          dpkg-deb -c "$deb_file" | grep -q "usr/bin/codex-plus-plus"
-          dpkg-deb -c "$deb_file" | grep -q "usr/bin/codex-plus-plus-manager"
-          echo "verified: $deb_file"
-
-      - name: Upload Linux DEB
+          cd /tmp
+          "$GITHUB_WORKSPACE/scripts/installer/linux/build-deb.sh" --help
+          test -f "$GITHUB_WORKSPACE/apps/codex-plus-manager/package.json"
+      - name: Build DEB from outside repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp
+          bash "$GITHUB_WORKSPACE/scripts/installer/linux/build-deb.sh" --package-only
+      - name: Verify package and install
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb_file="$(find dist/linux -maxdepth 1 -name "*.deb" -print -quit)"
+          test -n "$deb_file"
+          test "$(dpkg-deb -f "$deb_file" Package)" = "codex-plus-plus"
+          test "$(dpkg-deb -f "$deb_file" Version)" = "$(node -p 'require("./apps/codex-plus-manager/package.json").version')"
+          dpkg-deb -c "$deb_file" | grep -F "./usr/bin/codex-plus-plus"
+          if dpkg-deb -c "$deb_file" | grep -Fq "./usr/bin/codex-plus-plus-manager"; then exit 1; fi
+          sudo apt-get install -y "./$deb_file"
+          test -x /usr/bin/codex-plus-plus
+          dpkg -V codex-plus-plus
+          ldd /usr/bin/codex-plus-plus | tee /tmp/codex-plus-plus-ldd.log
+          ! grep -q "not found" /tmp/codex-plus-plus-ldd.log
+      - name: Upload DEB
         uses: actions/upload-artifact@v4
         with:
-          name: codex-plus-plus-linux-x64-deb
+          name: codex-plus-plus-linux-amd64-deb
           path: dist/linux/*.deb
           if-no-files-found: error

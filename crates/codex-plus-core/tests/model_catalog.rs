@@ -7,10 +7,42 @@ use std::thread;
 use codex_plus_core::model_catalog::{
     read_codex_model_catalog, read_codex_model_catalog_from_home,
 };
+use codex_plus_core::model_suffix::collect_catalog_entries;
 use codex_plus_core::settings::{
     BackendSettings, RelayMode, RelayProfile, RelayProtocol, SettingsStore,
 };
 use serde_json::json;
+
+#[test]
+fn catalog_entries_apply_manual_windows_case_insensitively() {
+    // 上游 /models 返回的 id 与本地保存的 key 常只差大小写；精确查表会让用户
+    // 配好的窗口整条落空，最后露出上游/Codex 默认的窗口。
+    let windows = HashMap::from([("DeepSeek-Flash".to_string(), "1m".to_string())]);
+    let compacts = HashMap::from([("DeepSeek-Flash".to_string(), "50%".to_string())]);
+    let entries = collect_catalog_entries("deepseek-flash\nglm-5.3", &windows, &compacts, "");
+    let deepseek = entries
+        .iter()
+        .find(|entry| entry.slug == "deepseek-flash")
+        .expect("模型条目缺失");
+    assert_eq!(deepseek.suffix_window, Some(1_000_000));
+    assert_eq!(deepseek.auto_compact_percent, Some(50_000_000));
+    // 没有配置窗口的模型不该被牵连。
+    let glm = entries
+        .iter()
+        .find(|entry| entry.slug == "glm-5.3")
+        .expect("模型条目缺失");
+    assert_eq!(glm.suffix_window, None);
+}
+
+#[test]
+fn catalog_entries_strip_suffix_from_row_name_and_look_up_window() {
+    // 行名带 [1M] 后缀时窗口来自后缀本身；没有后缀时来自 model_windows。
+    let entries =
+        collect_catalog_entries("deepseek-v4-pro[1M]", &HashMap::new(), &HashMap::new(), "");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].slug, "deepseek-v4-pro");
+    assert_eq!(entries[0].suffix_window, Some(1_000_000));
+}
 
 #[tokio::test]
 async fn model_catalog_fetches_models_from_codex_config_provider() {
@@ -224,6 +256,7 @@ async fn model_catalog_uses_active_relay_profile_model_list_and_actual_provider(
         store.save(&settings).unwrap();
         let result = read_codex_model_catalog().await;
 
+        settings = store.load().unwrap();
         settings.relay_profiles[0].relay_mode = RelayMode::Official;
         settings.relay_profiles[0].official_mix_api_key = false;
         settings.relay_profiles[0].config_contents = "model = \"qwen3-coder\"\n".to_string();
@@ -613,7 +646,9 @@ fn spawn_models_server_with_response(status: u16, body: String) -> ModelsServer 
     let handle = thread::spawn(move || {
         let started = std::time::Instant::now();
         let mut requests = Vec::new();
-        while requests.is_empty() && started.elapsed() < std::time::Duration::from_secs(2) {
+        // 接受窗口留足时间：并行跑测试或机器负载高时，客户端连接可能晚到，
+        // 2 秒窗口会造成「connection refused」偶发失败（CI/本地实测）。
+        while requests.is_empty() && started.elapsed() < std::time::Duration::from_secs(30) {
             let Ok((mut stream, _)) = listener.accept() else {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
@@ -621,7 +656,7 @@ fn spawn_models_server_with_response(status: u16, body: String) -> ModelsServer 
             let mut buffer = [0u8; 4096];
             let mut read = 0;
             let read_started = std::time::Instant::now();
-            while read == 0 && read_started.elapsed() < std::time::Duration::from_secs(2) {
+            while read == 0 && read_started.elapsed() < std::time::Duration::from_secs(10) {
                 match stream.read(&mut buffer) {
                     Ok(0) => std::thread::sleep(std::time::Duration::from_millis(10)),
                     Ok(bytes) => read = bytes,

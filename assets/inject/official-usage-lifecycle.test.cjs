@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 const source = fs.readFileSync(require.resolve("./renderer-inject.js"), "utf8");
 const begin = source.indexOf('  const officialUsageWindowMarker =');
-const end = source.indexOf('  let zedRemoteStatusPromise', begin);
+const end = source.indexOf('  function scanDeferred', begin);
 assert.ok(begin >= 0 && end > begin);
 const profile = source.slice(source.indexOf('  function codexRemoteSessionActiveProfile()'), source.indexOf('  function codexRemoteSessionProviderPatchEnabled()'));
 const install = `(function(){let codexPlusBackendSettings={};let codexPlusBackendSettingsLoaded=false;const sendCodexPlusDiagnostic=()=>{};${profile}\n${source.slice(begin, end)}})()`;
@@ -132,4 +132,16 @@ test("reinjecting before DOM readiness leaves only the newest observer",()=>{
   const f=fixture();f.document.body=null;f.inject(true);f.inject(true);f.document.body=f.body;
   for(const callback of [...f.domReady])callback();
   assert.equal(f.observers.filter(o=>o.active).length,1);
+});
+test("mixed mode also unlocks the per-model limit that blocks sending (#2646)",()=>{
+  const f=fixture(),api=f.inject(true);
+  const perModel={...usage(true),additional_rate_limits:[{limit_name:"gpt-6.1-sol",rate_limit:{allowed:false,limit_reached:true,used_percent:100}}]};
+  f.main.setData(perModel);
+  const limit=f.main.state.data.additional_rate_limits[0];
+  assert.equal(limit.rate_limit.allowed,true);
+  assert.equal(limit.rate_limit.limit_reached,false);
+  assert.equal(limit.rate_limit.used_percent,100);
+  assert.equal(limit.limit_name,"gpt-6.1-sol");
+  api.setBackendSettings(settings(false));api.install();
+  assert.equal(f.main.state.data.additional_rate_limits[0].rate_limit.allowed,false);
 });

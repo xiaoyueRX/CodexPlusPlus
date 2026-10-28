@@ -1,15 +1,67 @@
-  function syncActionGroupsLayout() {
-    sessionRows().forEach((row) => {
-      const group = actionGroupFromRow(row);
-      if (group) syncActionGroupLayout(row, group);
-    });
+  function syncActionGroupsLayout(force = false) {
+    syncActionGroupLayouts(sessionRows().map(row => ({
+      row, group: actionGroupFromRow(row),
+    })), force);
   }
 
   function removeActionGroups(row) {
     document.querySelectorAll(`.${moreMenuClass}`).forEach((menu) => {
-      if (menu.__codexSessionMoreRow === row) menu.remove();
+      if (menu.__codexSessionMoreRow === row) disposeSessionMoreMenu(menu);
     });
     row.querySelectorAll(`.${actionGroupClass}`).forEach((group) => group.remove());
+  }
+
+  function closeSessionMoreMenu(menu) {
+    menu.hidden = true;
+    const row = menu.__codexSessionMoreRow || menu.closest?.("[data-codex-delete-row]");
+    row?.classList?.remove("codex-session-more-open");
+    menu.__codexSessionMoreGroup?.querySelector?.(`.${moreButtonClass}`)?.setAttribute("aria-expanded", "false");
+  }
+
+  function disposeSessionMoreMenu(menu) {
+    closeSessionMoreMenu(menu);
+    menu.__codexSessionMoreCleanup?.();
+    const group = menu.__codexSessionMoreGroup;
+    if (group?.__codexSessionMoreMenu === menu) group.__codexSessionMoreMenu = null;
+    menu.__codexSessionMoreCleanup = null;
+    menu.__codexSessionMoreRow = null;
+    menu.__codexSessionMoreGroup = null;
+    menu.remove();
+  }
+
+  function pruneSessionMoreMenus(removedMenus = []) {
+    let needsScan = false;
+    const needsDelete = codexPlusSettings().sessionDelete;
+    // 菜单挂在 body 下，不会随 React 会话行一起卸载；复用现有观察器及时释放。
+    const menus = new Set([...document.querySelectorAll(`.${moreMenuClass}`), ...removedMenus]);
+    menus.forEach((menu) => {
+      const row = menu.__codexSessionMoreRow;
+      const group = menu.__codexSessionMoreGroup;
+      if (!menu.isConnected || !row?.isConnected || !group?.isConnected || !row.contains(group)
+          || !group.querySelector(`.${moreButtonClass}`)
+          || (needsDelete && !group.querySelector(`.${buttonClass}`))) {
+        if (row?.isConnected) needsScan = true;
+        disposeSessionMoreMenu(menu);
+      }
+    });
+    return needsScan;
+  }
+
+  function pruneRemovedSessionActions(mutations) {
+    let relevantRemoval = false;
+    const removedMenus = new Set();
+    const menuSelector = `.${moreMenuClass}`;
+    const actionSelector = `.${actionGroupClass}, .${moreButtonClass}, .${buttonClass}, ${menuSelector}`;
+    for (const mutation of mutations || []) {
+      for (const node of mutation.removedNodes) {
+        if (node.nodeType !== 1 || (!node.matches(actionSelector) && !node.querySelector(actionSelector))) continue;
+        relevantRemoval = true;
+        if (node.matches(menuSelector)) removedMenus.add(node);
+        node.querySelectorAll(menuSelector).forEach((menu) => removedMenus.add(menu));
+      }
+    }
+    // 同步移动和按钮克隆替换在观察器回调前已完成，只依据最终连接状态判断。
+    return relevantRemoval && pruneSessionMoreMenus(removedMenus);
   }
 
   function stopActionButtonEvent(row, button, event) {
@@ -51,9 +103,7 @@
   function closeSessionMoreMenus(exceptMenu = null) {
     document.querySelectorAll(`.${moreMenuClass}`).forEach((menu) => {
       if (menu !== exceptMenu) {
-        menu.hidden = true;
-        menu.closest?.("[data-codex-delete-row]")?.classList.remove("codex-session-more-open");
-        menu.__codexSessionMoreRow?.classList?.remove("codex-session-more-open");
+        closeSessionMoreMenu(menu);
       }
     });
   }
@@ -68,19 +118,27 @@
 
   function installSessionMoreMenuAutoClose(row, menu) {
     const group = menu.__codexSessionMoreGroup || menu.closest?.(`.${actionGroupClass}`);
+    let closeTimer = null;
     const closeIfOutside = () => {
-      window.setTimeout(() => {
+      window.clearTimeout(closeTimer);
+      closeTimer = window.setTimeout(() => {
+        closeTimer = null;
         if (menu.hidden) return;
         const active = document.activeElement;
         if (group?.matches?.(":hover") || menu.matches?.(":hover") || menu.contains(active)) return;
-        menu.hidden = true;
-        row.classList.remove("codex-session-more-open");
-        group?.querySelector?.(`.${moreButtonClass}`)?.setAttribute("aria-expanded", "false");
+        closeSessionMoreMenu(menu);
       }, 80);
     };
     group?.addEventListener("pointerleave", closeIfOutside, true);
     menu.addEventListener("pointerleave", closeIfOutside, true);
     menu.addEventListener("focusout", closeIfOutside, true);
+    menu.__codexSessionMoreCleanup = () => {
+      window.clearTimeout(closeTimer);
+      closeTimer = null;
+      group?.removeEventListener("pointerleave", closeIfOutside, true);
+      menu.removeEventListener("pointerleave", closeIfOutside, true);
+      menu.removeEventListener("focusout", closeIfOutside, true);
+    };
   }
 
   function updateSessionMoreMenuDirection(button, menu) {
@@ -140,36 +198,146 @@
     return replacement;
   }
 
-  function configureActionButton(button, label, icon) {
-    button.setAttribute("aria-label", label);
-    button.dataset.codexActionLabel = label;
-    button.removeAttribute("title");
-    button.textContent = icon;
+  // 会话行图标按钮的线性图标统一画在 16 栅格上，线宽 1.05、圆角端点：与 Codex
+  // 原生「置顶 / 归档」所用 light-16 图标的笔画粗细和墨迹范围一致。原生如果换成
+  // 描边图标，syncNativeSessionActionStyle 会按它的 stroke-width 换算后覆盖。
+  const sessionActionIconStrokeWidth = "1.05";
+
+  function sessionActionStrokeIconSvg(paths) {
+    return `<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="${sessionActionIconStrokeWidth}" stroke-linecap="round" stroke-linejoin="round" data-codex-session-action-icon="stroke">${paths}</svg>`;
   }
 
   function trashIconSvg() {
-    return `
-      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M3 6h18"></path>
-        <path d="M8 6V4h8v2"></path>
-        <path d="M19 6l-1 14H6L5 6"></path>
-        <path d="M10 11v5"></path>
-        <path d="M14 11v5"></path>
-      </svg>
-    `;
+    return sessionActionStrokeIconSvg([
+      '<path d="M2.5 4.5h11"></path>',
+      '<path d="M6 4.5v-1a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1"></path>',
+      '<path d="M3.75 4.5v8a1 1 0 0 0 1 1h6.5a1 1 0 0 0 1-1v-8"></path>',
+      '<path d="M6.75 7v3.75"></path>',
+      '<path d="M9.25 7v3.75"></path>',
+    ].join(""));
+  }
+
+  function ellipsisIconSvg() {
+    return '<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" fill="currentColor" data-codex-session-action-icon="fill"><circle cx="3.5" cy="8" r="1.1"></circle><circle cx="8" cy="8" r="1.1"></circle><circle cx="12.5" cy="8" r="1.1"></circle></svg>';
   }
 
   function configureSvgActionButton(button, label, svg) {
     button.setAttribute("aria-label", label);
     button.dataset.codexActionLabel = label;
     button.removeAttribute("title");
-    button.innerHTML = svg;
+    // 原生按钮的图标包在一层 inner span 里（负责居中），这里保持同样结构，
+    // 套用原生类名时 inner span 也一并换成原生的 inner 类名。
+    button.innerHTML = `<span class="codex-session-action-inner">${svg}</span>`;
+  }
+
+  // Codex 原生按钮的外观由 CSS module 类名 + data-color / data-variant / data-size
+  // 等属性共同决定，只抄 className 不够，这些属性要一起带上。
+  const nativeSessionActionStyleAttributes = [
+    "data-color", "data-variant", "data-size", "data-uniform", "data-pill",
+    "data-squircle", "data-icon-size", "data-gutter-size",
+  ];
+  // 最近一次从原生按钮读到的样式快照；新建的按钮直接套用，不必等悬停。
+  let nativeSessionActionStyle = null;
+
+  function nativeSessionIconButtonFromRow(row) {
+    for (const button of row?.querySelectorAll?.("button") || []) {
+      if (button.closest(`.${actionGroupClass}, [data-codex-plus-ext]`)) continue;
+      const label = `${button.getAttribute("aria-label") || ""} ${button.getAttribute("title") || ""}`;
+      if (!/(pin|archive|置顶|归档)/i.test(label)) continue;
+      // 只认纯图标按钮：归档二次确认的「确认」是带文字的危险色按钮，不能当样板。
+      // 原生图标也可能不是内联 svg，等宽（data-uniform）的图标按钮同样可以当样板。
+      if ((button.textContent || "").trim()) continue;
+      if (!button.querySelector("svg") && !button.hasAttribute("data-uniform")) continue;
+      if (button.getAttribute("data-color") === "danger") continue;
+      return button;
+    }
+    return null;
+  }
+
+  function nativeSessionIconStrokeWidth(svg) {
+    const stroked = svg?.matches?.("[stroke-width]") ? svg : svg?.querySelector?.("[stroke-width]");
+    const width = Number.parseFloat(stroked?.getAttribute("stroke-width") || "");
+    const viewBoxWidth = Number.parseFloat((svg?.getAttribute("viewBox") || "").trim().split(/[\s,]+/)[2] || "");
+    if (!(width > 0) || !(viewBoxWidth > 0)) return "";
+    return String(Math.round((width * 16 / viewBoxWidth) * 100) / 100);
+  }
+
+  function readNativeSessionActionStyle(button) {
+    const className = typeof button?.className === "string" ? button.className.trim() : "";
+    if (!className) return null;
+    const attributes = {};
+    nativeSessionActionStyleAttributes.forEach((name) => {
+      if (button.hasAttribute(name)) attributes[name] = button.getAttribute(name);
+    });
+    const inner = Array.from(button.children).find((child) => child.tagName === "SPAN" && child.querySelector("svg"));
+    const innerClassName = typeof inner?.className === "string" ? inner.className.trim() : "";
+    const strokeWidth = nativeSessionIconStrokeWidth(button.querySelector("svg"));
+    return {
+      className, attributes, innerClassName, strokeWidth,
+      key: JSON.stringify([className, attributes, innerClassName, strokeWidth]),
+    };
+  }
+
+  function applyNativeSessionActionStyle(button, style = nativeSessionActionStyle) {
+    if (!(button instanceof HTMLElement)) return;
+    // 自己的类名（删除 / 更多的识别类）记在 dataset 上，换原生类名时始终保留。
+    if (!button.dataset.codexActionClasses) button.dataset.codexActionClasses = button.className;
+    if (!style || button.__codexNativeStyleKey === style.key) return;
+    button.className = `${style.className} ${button.dataset.codexActionClasses}`;
+    nativeSessionActionStyleAttributes.forEach((name) => button.removeAttribute(name));
+    Object.entries(style.attributes).forEach(([name, value]) => button.setAttribute(name, value));
+    const inner = button.querySelector(".codex-session-action-inner");
+    if (inner) inner.className = `codex-session-action-inner ${style.innerClassName}`.trim();
+    button.querySelectorAll('svg[data-codex-session-action-icon="stroke"]').forEach((svg) => {
+      svg.setAttribute("stroke-width", style.strokeWidth || sessionActionIconStrokeWidth);
+    });
+    button.setAttribute("data-codex-native-style", "true");
+    button.__codexNativeStyleKey = style.key;
+  }
+
+  function syncNativeSessionActionStyle(row) {
+    const native = nativeSessionIconButtonFromRow(row);
+    const style = native ? readNativeSessionActionStyle(native) : null;
+    const changed = !!style && style.key !== nativeSessionActionStyle?.key;
+    if (changed) nativeSessionActionStyle = style;
+    if (!nativeSessionActionStyle) return;
+    // 原生样式变了（Codex 改版或首次读到）就刷新所有行，否则只补当前行。
+    const scope = changed ? document : actionGroupFromRow(row);
+    scope?.querySelectorAll?.(`.${actionButtonClass}`)
+      .forEach((button) => applyNativeSessionActionStyle(button));
+  }
+
+  function installNativeSessionActionStyleSync(row) {
+    if (row.__codexNativeActionStyleSync) return;
+    row.__codexNativeActionStyleSync = true;
+    // 原生置顶 / 归档按钮多数只在悬停时挂载，当帧还没渲染出来，等下一帧再读。
+    row.addEventListener("pointerenter", () => {
+      window.requestAnimationFrame(() => {
+        if (row.isConnected) syncNativeSessionActionStyle(row);
+      });
+    }, { passive: true });
+  }
+
+  /**
+   * 会话行「…」菜单要放哪些项。返回空串表示没有任何菜单项，此时不渲染「…」按钮。
+   * 内置只剩 Markdown 导出；其余来自拓展注册的会话行操作（增强总开关关闭时不显示）。
+   * 返回值同时用作菜单指纹：项变了（开关切换、拓展注册 / 注销）就整组重建。
+   */
+  function sessionMoreMenuKey(settings) {
+    const rowActions = codexPlusBackendSettings.enhancementsEnabled !== false
+      ? codexPlusExtensionItems(codexPlusRegistry.rowActions)
+      : [];
+    return [
+      ...(settings.markdownExport ? ["export"] : []),
+      ...rowActions.map((item) => `ext:${item.id}`),
+    ].join("|");
   }
 
   function attachButton(row) {
     const settings = codexPlusSettings();
-    const sessionMenuEnabled = codexPlusBackendSettings.enhancementsEnabled !== false;
-    if (!settings.sessionDelete && !settings.markdownExport && !sessionMenuEnabled) {
+    const moreMenuKey = sessionMoreMenuKey(settings);
+    const needsMoreMenu = !!moreMenuKey;
+    if (!settings.sessionDelete && !needsMoreMenu) {
       removeActionGroups(row);
       row.dataset.codexDeleteRow = "false";
       return;
@@ -178,7 +346,6 @@
     const existingDeleteButton = existingGroup?.querySelector(`.${buttonClass}`);
     const existingMoreButton = existingGroup?.querySelector(`.${moreButtonClass}`);
     const existingExportButton = existingGroup?.querySelector(`.${exportButtonClass}`);
-    const needsMoreMenu = sessionMenuEnabled;
     const hasUnexpectedDelete = !settings.sessionDelete && !!existingDeleteButton;
     const hasUnexpectedMore = !needsMoreMenu && !!existingMoreButton;
     const hasUnexpectedExport = !!existingExportButton;
@@ -186,7 +353,11 @@
     const missingMore = needsMoreMenu && !existingMoreButton;
     const deleteReady = !settings.sessionDelete || existingDeleteButton?.dataset.codexDeleteVersion === codexDeleteVersion;
     const groupReady = existingGroup?.dataset.codexActionGroupVersion === codexActionGroupVersion;
-    if (groupReady && deleteReady && !hasUnexpectedDelete && !hasUnexpectedMore && !hasUnexpectedExport && !missingDelete && !missingMore) {
+    const existingMenu = existingGroup?.__codexSessionMoreMenu;
+    const menuReady = !needsMoreMenu || (existingMenu?.isConnected
+      && existingMenu.__codexSessionMoreRow === row && existingMenu.__codexSessionMoreGroup === existingGroup
+      && existingGroup.dataset.codexMoreMenuKey === moreMenuKey);
+    if (groupReady && deleteReady && menuReady && !hasUnexpectedDelete && !hasUnexpectedMore && !hasUnexpectedExport && !missingDelete && !missingMore) {
       return;
     }
     removeActionGroups(row);
@@ -196,16 +367,20 @@
     row.dataset.codexDeleteRow = "true";
     const group = document.createElement("div");
     group.className = actionGroupClass;
+    group.setAttribute("data-codex-plus-ext", "session-actions");
     group.dataset.codexActionGroupVersion = codexActionGroupVersion;
+    group.dataset.codexMoreMenuKey = moreMenuKey;
     if (needsMoreMenu) {
       const moreButton = document.createElement("button");
       moreButton.type = "button";
       moreButton.className = `${actionButtonClass} ${moreButtonClass}`;
       moreButton.setAttribute("aria-haspopup", "menu");
       moreButton.setAttribute("aria-expanded", "false");
-      configureActionButton(moreButton, "更多操作", "…");
+      configureSvgActionButton(moreButton, "更多操作", ellipsisIconSvg());
+      applyNativeSessionActionStyle(moreButton);
       const moreMenu = document.createElement("div");
       moreMenu.className = moreMenuClass;
+      moreMenu.setAttribute("data-codex-plus-ext", "session-more-menu");
       moreMenu.setAttribute("role", "menu");
       moreMenu.hidden = true;
       if (settings.markdownExport) {
@@ -215,20 +390,11 @@
           exportMarkdown(ref);
         }));
       }
-      if (sessionMenuEnabled) {
-        const sessionCopyItem = createSessionMoreMenuItem("原地复制会话 - Codex++", "⧉", activateSessionCopyMenuItem);
-        sessionCopyItem.dataset.codexSessionCopyMenu = "true";
-        sessionCopyItem.dataset.codexSessionCopyVersion = sessionCopyMenuItemVersion;
-        sessionCopyItem.__codexSessionCopyRow = row;
-        moreMenu.appendChild(sessionCopyItem);
-        const sessionAutoRenameItem = createSessionMoreMenuItem("自动重命名当前会话", "✦", activateSessionAutoRenameMenuItem);
-        sessionAutoRenameItem.dataset.codexSessionAutoRenameMenu = "true";
-        sessionAutoRenameItem.__codexSessionAutoRenameRow = row;
-        moreMenu.appendChild(sessionAutoRenameItem);
+      // 拓展注册的会话行操作追加在内置项之后。注册 / 注销会改变 moreMenuKey，
+      // 触发整组重建并重新走一遍这里，所以拓展项不会因为重建而丢失。
+      if (codexPlusBackendSettings.enhancementsEnabled !== false) {
+        appendCodexPlusExtensionRowActions(moreMenu, row, moreButton);
       }
-      // 拓展注册的会话行操作追加在内置项之后。菜单每次重建（版本号变化）都会
-      // 重新走一遍这里，所以拓展项不会因为重建而丢失。
-      appendCodexPlusExtensionRowActions(moreMenu, row, moreButton);
       const openMoreMenu = (event) => {
         stopActionButtonEvent(row, moreButton, event);
         hideActionButtonTooltip();
@@ -242,6 +408,7 @@
       group.appendChild(moreButton);
       moreMenu.__codexSessionMoreRow = row;
       moreMenu.__codexSessionMoreGroup = group;
+      group.__codexSessionMoreMenu = moreMenu;
       document.body.appendChild(moreMenu);
       installSessionMoreMenuAutoClose(row, moreMenu);
     }
@@ -251,12 +418,16 @@
       deleteButton.className = `${actionButtonClass} ${buttonClass}`;
       deleteButton.dataset.codexDeleteVersion = codexDeleteVersion;
       configureSvgActionButton(deleteButton, "删除", trashIconSvg());
+      applyNativeSessionActionStyle(deleteButton);
       const openDeleteConfirm = (event) => openDeleteConfirmForRow(row, deleteButton, sessionRefFromRow(row), event);
       installActionButtonEvents(row, deleteButton, openDeleteConfirm);
       group.appendChild(deleteButton);
       setTimeout(() => refreshActionButton(deleteButton, row, openDeleteConfirm), 0);
     }
     row.appendChild(group);
+    // 先套上原生按钮外观再量布局，避免尺寸在测量后才变化。
+    syncNativeSessionActionStyle(row);
+    installNativeSessionActionStyleSync(row);
     syncActionGroupLayout(row, group);
   }
 
@@ -419,6 +590,7 @@
   // 页脚包裹层同样带 `max-w-(--thread-…-max-width)`，会被结构候选误当成内容容器。
   // 用 Codex 自己的页脚标记把它排掉。
   const conversationViewFooterSelector = selectors.conversationViewFooter;
+  const conversationViewPaneBoundarySelector = "#app-shell-sidebar, .app-shell-left-panel, .sidebar-navigation, nav[data-app-navigation-rail], [data-summary-panel-variant]";
   // 两侧留白：Codex 的 `--padding-toolbar` 是 `calc(var(--spacing) * 2)`（= 8px * 2）。
   // 仅在拿不到父节点 computed style 时作为回落的单侧留白。
   const conversationViewSideInset = 8;
@@ -446,8 +618,9 @@
     return classes.every((cls) => set.has(cls));
   }
 
-  function conversationViewFindByClasses(classes) {
-    return Array.from(document.querySelectorAll("div")).find((el) => conversationViewHasAllClasses(el, classes)) || null;
+  function conversationViewFindByClasses(classes, root, accept) {
+    return Array.from(root?.querySelectorAll("div") || [])
+      .find((el) => conversationViewHasAllClasses(el, classes) && accept(el)) || null;
   }
 
   function conversationViewHasThreadWidthToken(el) {
@@ -477,7 +650,62 @@
   }
 
   function conversationViewScrollContainer() {
-    return document.querySelector(conversationViewScrollContainerSelector);
+    const scrollers = Array.from(document.querySelectorAll(conversationViewScrollContainerSelector))
+      .filter((el) => typeof visibleElement !== "function" || visibleElement(el));
+    // 多个可见会话没有可靠的当前目标，不把任一 pane 当成整页正文。
+    return scrollers.length === 1 ? scrollers[0] : null;
+  }
+
+  function conversationViewSafeWidthTarget(el, scope) {
+    if (!el || !scope || el === scope || !scope.contains?.(el)) return false;
+    if (scope.matches?.(conversationViewScrollContainerSelector)
+        && el.closest?.(conversationViewScrollContainerSelector) !== scope) return false;
+    return conversationViewSafeWidthNode(el);
+  }
+
+  function conversationViewSafeWidthNode(el) {
+    if (!el) return false;
+    if (["MAIN", "ASIDE", "NAV", "HEADER", "BODY", "HTML"].includes(el.tagName)) return false;
+    if (el.closest?.(`${conversationViewPaneBoundarySelector}, [data-codex-plus-ext]`)) return false;
+    // CSS 变量可继承给整棵布局树；包含其他 pane 的祖先不能改 width/margin/left。
+    // composer 内的状态提示也会用 aside，不能仅按语义标签把它误判为侧栏。
+    return !el.querySelector?.(`${conversationViewPaneBoundarySelector}, .thread-scroll-container`);
+  }
+
+  function conversationViewSamePane(scroller, el) {
+    if (scroller.contains?.(el)) return el.closest?.(conversationViewScrollContainerSelector) === scroller;
+    if (el.closest?.(conversationViewScrollContainerSelector)) return false;
+    if (el.parentElement === scroller.parentElement && el.parentElement !== document.body) return true;
+    for (let pane = scroller.parentElement; pane && pane !== document.body; pane = pane.parentElement) {
+      if (!pane.contains?.(el)) continue;
+      return !pane.querySelector?.(conversationViewPaneBoundarySelector);
+    }
+    return false;
+  }
+
+  function conversationViewFootersFor(scroller) {
+    return Array.from(document.querySelectorAll(conversationViewFooterSelector)).filter((footer) => {
+      if (typeof visibleElement === "function" && !visibleElement(footer)) return false;
+      return !footer.closest?.(`${conversationViewPaneBoundarySelector}, [data-codex-plus-ext]`) && conversationViewSamePane(scroller, footer);
+    });
+  }
+
+  function conversationViewFindNativeComposer(scroller) {
+    const roots = Array.from(document.querySelectorAll("[data-codex-composer-root]"))
+      .filter((el) => (typeof visibleElement !== "function" || visibleElement(el))
+        && !el.closest?.(`${conversationViewPaneBoundarySelector}, [data-codex-plus-ext]`) && (!scroller || conversationViewSamePane(scroller, el)));
+    if (roots.length !== 1) return null;
+    const root = roots[0];
+    const accept = (el) => conversationViewLooksLikeThreadWidthBox(el) && conversationViewSafeWidthNode(el)
+      && !el.matches?.(conversationViewFooterSelector) && !el.querySelector?.(conversationViewContentAnchorSelector);
+    const inside = [root, ...root.querySelectorAll("div")].find(accept);
+    if (inside) return inside;
+    // 原生 composer 锚点可能在宽度宿主内部；只爬到局部宿主，不收窄含正文的布局。
+    for (let host = root.parentElement; host && host !== document.body; host = host.parentElement) {
+      if (accept(host)) return host;
+      if (host.matches?.(conversationViewScrollContainerSelector) || host.querySelector?.(conversationViewScrollContainerSelector)) break;
+    }
+    return null;
   }
 
   function conversationViewCollectThreadWidthBoxes(root) {
@@ -489,6 +717,7 @@
    * 按候选顺序找内容容器，任一候选命中即返回。
    *
    * 候选链刻意从「最精确」排到「最宽松」：
+   * 所有候选都必须在唯一的会话滚动区内，并排除布局祖先：
    *   1. 旧版类名全等（老版本 Codex 上仍然最准）；
    *   2. Codex 自己的 data-* 锚点（当前版本）；
    *   3. 结构判定（滚动容器内、居中满宽、带 thread 宽度工具类）；
@@ -497,34 +726,52 @@
    * 顺序不能反：结构判定会把页脚包裹层也算进来，而它和内容容器在同一棵子树里。
    */
   function conversationViewFindContentEl() {
-    const legacy = conversationViewFindByClasses(conversationViewContentClasses);
-    if (legacy && !conversationViewIsInsideFooter(legacy)) return legacy;
-    const anchored = document.querySelector(conversationViewContentAnchorSelector);
-    if (anchored) return anchored;
     const scroller = conversationViewScrollContainer();
-    const structural = conversationViewCollectThreadWidthBoxes(scroller || document)
+    if (!scroller) return null;
+    const accept = (el) => conversationViewSafeWidthTarget(el, scroller) && !conversationViewIsInsideFooter(el)
+      && !el.querySelector?.(conversationViewFooterSelector);
+    const legacy = conversationViewFindByClasses(conversationViewContentClasses, scroller, accept);
+    if (legacy) return legacy;
+    const anchored = Array.from(scroller.querySelectorAll(conversationViewContentAnchorSelector)).find(accept);
+    if (anchored) return anchored;
+    const structural = conversationViewCollectThreadWidthBoxes(scroller)
       // 页脚包裹层（data-thread-scroll-footer）也带同样的宽度工具类，必须排掉。
-      .find((el) => !conversationViewIsInsideFooter(el));
+      .find(accept);
     if (structural) return structural;
-    return conversationViewFindByThreadWidthVariable(scroller || document);
+    return conversationViewFindByThreadWidthVariable(scroller, accept);
   }
 
   function conversationViewFindComposerEl() {
+    const scroller = conversationViewScrollContainer();
+    if (!scroller) {
+      // 首页没有消息 scroller；只用明确的原生 composer 锚点，不能全页猜宽度变量。
+      if (Array.from(document.querySelectorAll(conversationViewScrollContainerSelector))
+          .some((el) => typeof visibleElement !== "function" || visibleElement(el))) return null;
+      const native = conversationViewFindNativeComposer(null);
+      if (native) return native;
+      const legacy = Array.from(document.querySelectorAll("div")).filter((el) =>
+        conversationViewHasAllClasses(el, conversationViewComposerClasses) && conversationViewSafeWidthNode(el)
+        && !conversationViewIsInsideFooter(el) && el.querySelector?.('textarea, [contenteditable="true"]'));
+      return legacy.length === 1 ? legacy[0] : null;
+    }
     // 页脚包裹层带的是和作曲器同一套工具类，会被旧清单全等命中，所以要排除它。
-    const footer = document.querySelector(conversationViewFooterSelector);
-    const legacy = conversationViewFindByClasses(conversationViewComposerClasses);
-    if (legacy && !conversationViewIsInsideFooter(legacy)) return legacy;
+    const footers = conversationViewFootersFor(scroller);
+    if (footers.length > 1) return null;
+    const footer = footers[0];
+    const accept = (el) => conversationViewSafeWidthTarget(el, footer || scroller)
+      && !el.matches?.(conversationViewFooterSelector) && !conversationViewIsContentCandidate(el);
     // 新版作曲器在页脚包裹层内部——页脚自身也是 max-w 盒子，得往里再找一层。
-    const insideFooter = conversationViewCollectThreadWidthBoxes(footer)[0];
+    const insideFooter = conversationViewCollectThreadWidthBoxes(footer).find(accept);
     if (insideFooter) return insideFooter;
-    // 老版本作曲器不在页脚里；退回整棵文档，但只认页脚缺席时的候选，
-    // 且排除内容容器（两者宽度工具类同形）。
-    const scroller = conversationViewScrollContainer() || document;
-    const anywhere = conversationViewCollectThreadWidthBoxes(scroller)
-      .find((el) => !conversationViewIsContentCandidate(el));
-    if (anywhere) return anywhere;
-    if (footer) return conversationViewFindByThreadWidthVariable(footer, (el) => el !== footer);
-    return conversationViewFindByThreadWidthVariable(document, (el) => !conversationViewIsContentCandidate(el));
+    if (footer) return conversationViewFindByThreadWidthVariable(footer, (el) => el !== footer && accept(el));
+    const native = conversationViewFindNativeComposer(scroller);
+    if (native) return native;
+    // 保留同一会话内的旧类名；无 footer 的新版结构还必须包含明确编辑器。
+    const legacy = conversationViewFindByClasses(conversationViewComposerClasses, scroller, (el) => accept(el) && !conversationViewIsInsideFooter(el));
+    if (legacy) return legacy;
+    return conversationViewCollectThreadWidthBoxes(scroller).find((el) => accept(el)
+      && !conversationViewIsInsideFooter(el) && !el.querySelector?.(conversationViewContentAnchorSelector)
+      && el.querySelector?.('textarea, [contenteditable="true"]')) || null;
   }
 
   // 内容容器的判定（锚点或全等类名），供作曲器查找排除同形节点用。
@@ -544,6 +791,8 @@
       if (accept ? !accept(el) : conversationViewIsInsideFooter(el)) return false;
       try {
         const style = getComputedStyle(el);
+        // --thread-* 在后代继承，不代表该节点自身受 max-width 约束（#2414）。
+        if (!style.maxWidth || style.maxWidth === "none") return false;
         for (const name of conversationViewThreadWidthCustomProperties(style)) {
           if (String(style.getPropertyValue(name) || "").trim()) return true;
         }
@@ -567,199 +816,7 @@
     return names;
   }
 
-  function codexServiceTierBadgeVisibleElement(element) {
-    if (!(element instanceof HTMLElement) || !element.isConnected) return false;
-    const style = getComputedStyle(element);
-    if (style.display === "none" || style.visibility === "hidden") return false;
-    const rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  }
-
-  function codexServiceTierBadgeText(element) {
-    return String(element?.textContent || "").replace(/\s+/g, " ").trim();
-  }
-
-  function codexServiceTierKnownProviderNames() {
-    return uniqueValues([
-      codexModelCatalog.provider_name,
-      codexModelCatalog.model_provider,
-    ]).map((value) => value.toLowerCase());
-  }
-
-  function codexServiceTierLooksLikeProviderButton(button, providerNames) {
-    const text = codexServiceTierBadgeText(button);
-    if (!text || text.length > 32) return false;
-    const lower = text.toLowerCase();
-    if (providerNames.includes(lower)) return true;
-    if (/\s/.test(text)) return false;
-    if (!/[a-z]/i.test(text)) return false;
-    if (!/^[a-z0-9][a-z0-9._-]{1,31}$/i.test(text)) return false;
-    if (/^(local|remote|cloud|standard|default|fast|worktree|new|send|stop|codex)$/i.test(text)) return false;
-    if (/^(gpt|o[1-9]|claude|gemini|deepseek|qwen|kimi|moonshot|mistral|llama|sonnet|opus|haiku)[a-z0-9._-]*$/i.test(text)) return false;
-    return true;
-  }
-
-  function codexServiceTierBadgeButtonCandidates(composer) {
-    const composerRect = composer.getBoundingClientRect();
-    return Array.from(composer.querySelectorAll("button, [role='button']"))
-      .filter((button) => !button.closest?.(`[data-codex-service-tier-badge="true"]`))
-      .filter(codexServiceTierBadgeVisibleElement)
-      .filter((button) => {
-        const rect = button.getBoundingClientRect();
-        return rect.bottom >= composerRect.top + composerRect.height * 0.35;
-      })
-      .sort((left, right) => {
-        const leftRect = left.getBoundingClientRect();
-        const rightRect = right.getBoundingClientRect();
-        return (rightRect.bottom - leftRect.bottom) || (leftRect.left - rightRect.left);
-      });
-  }
-
-  function codexServiceTierVisibleComposerFooters(root = document) {
-    const footers = [
-      ...(root?.matches?.(".composer-footer") ? [root] : []),
-      ...Array.from(root?.querySelectorAll?.(".composer-footer") || []),
-    ];
-    return footers
-      .filter(codexServiceTierBadgeVisibleElement)
-      .sort((left, right) => {
-        const leftRect = left.getBoundingClientRect();
-        const rightRect = right.getBoundingClientRect();
-        return (rightRect.bottom - leftRect.bottom) || (rightRect.width - leftRect.width);
-      });
-  }
-
-  function codexServiceTierComposerScore(composer) {
-    const text = codexServiceTierBadgeText(composer).toLowerCase();
-    const providerNames = codexServiceTierKnownProviderNames();
-    let score = 0;
-    if (providerNames.some((name) => name && text.includes(name))) score += 40;
-    if (/完全访问权限|full access|model|超高|high|sub2api|provider/i.test(text)) score += 20;
-    if (/本地模式|local mode|worktree|branch|codex\//i.test(text)) score -= 30;
-    if (composer.matches?.(".composer-footer")) score += 4;
-    if (composer.querySelector?.(".composer-footer")) score += 8;
-    const buttons = Array.from(composer.querySelectorAll?.("button, [role='button']") || []).filter(codexServiceTierBadgeVisibleElement);
-    if (buttons.some((button) => codexServiceTierLooksLikeProviderButton(button, providerNames))) score += 30;
-    score += Math.min(10, buttons.length);
-    return score;
-  }
-
-  function codexServiceTierComposerCandidates() {
-    const candidates = new Set();
-    const threadComposer = conversationViewFindComposerEl();
-    if (threadComposer && codexServiceTierBadgeVisibleElement(threadComposer)) candidates.add(threadComposer);
-    codexServiceTierVisibleComposerFooters().forEach((footer) => {
-      candidates.add(footer);
-      let node = footer.parentElement;
-      for (let depth = 0; node instanceof HTMLElement && depth < 6; depth += 1, node = node.parentElement) {
-        if (codexServiceTierBadgeVisibleElement(node)) candidates.add(node);
-      }
-    });
-    return Array.from(candidates);
-  }
-
-  function codexServiceTierBestComposerFooter(root = document) {
-    return codexServiceTierVisibleComposerFooters(root)
-      .map((footer, index) => ({ footer, index, score: codexServiceTierComposerScore(footer) }))
-      .sort((left, right) => (right.score - left.score) || (left.index - right.index))[0]?.footer || null;
-  }
-
-  function codexServiceTierFindComposerEl() {
-    return codexServiceTierComposerCandidates()
-      .map((composer, index) => ({ composer, index, score: codexServiceTierComposerScore(composer) }))
-      .sort((left, right) => (right.score - left.score) || (left.index - right.index))[0]?.composer || null;
-  }
-
-  function codexServiceTierBadgeAnchor(composer) {
-    const providerNames = codexServiceTierKnownProviderNames();
-    const buttons = codexServiceTierBadgeButtonCandidates(composer);
-    const exact = buttons.find((button) => providerNames.includes(codexServiceTierBadgeText(button).toLowerCase()));
-    if (exact) return exact;
-    const composerRect = composer.getBoundingClientRect();
-    return buttons.find((button) => {
-      const rect = button.getBoundingClientRect();
-      return rect.left >= composerRect.left + composerRect.width * 0.42 && codexServiceTierLooksLikeProviderButton(button, providerNames);
-    }) || null;
-  }
-
-  function codexServiceTierComposerFooter(composer) {
-    if (composer?.matches?.(".composer-footer")) return composer;
-    return codexServiceTierBestComposerFooter(composer) || codexServiceTierBestComposerFooter() || null;
-  }
-
-  function codexServiceTierBadgeFooterGroup(composer) {
-    const footer = codexServiceTierComposerFooter(composer);
-    if (!footer) return null;
-    const children = Array.from(footer.children).filter(codexServiceTierBadgeVisibleElement);
-    if (!children.length) return footer;
-    const providerNames = codexServiceTierKnownProviderNames();
-    const providerGroup = children.find((child) => {
-      const text = codexServiceTierBadgeText(child).toLowerCase();
-      return providerNames.some((name) => name && text.includes(name));
-    });
-    return providerGroup || children[children.length - 1] || footer;
-  }
-
-  function codexServiceTierBadgePlacement(composer) {
-    const anchor = composer ? codexServiceTierBadgeAnchor(composer) : null;
-    if (anchor?.parentElement) return { parent: anchor.parentElement, before: anchor };
-    const group = composer ? codexServiceTierBadgeFooterGroup(composer) : null;
-    if (group) return { parent: group, before: group.firstChild };
-    return null;
-  }
-
-  function wireCodexServiceTierBadge(badge) {
-    if (!badge || badge.dataset.codexServiceTierBadgeWired === codexServiceTierBadgeVersion) return;
-    badge.dataset.codexServiceTierBadgeWired = codexServiceTierBadgeVersion;
-    badge.setAttribute("role", "button");
-    badge.setAttribute("tabindex", "0");
-    badge.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      if (codexServiceTierState.status === "loading") return;
-      toggleCodexServiceTierFromBadge();
-    });
-    badge.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" && event.key !== " ") return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (codexServiceTierState.status === "loading") return;
-      toggleCodexServiceTierFromBadge();
-    });
-  }
-
-  function installCodexServiceTierBadge() {
-    if (!codexPlusSettings().serviceTierControls) {
-      removeCodexServiceTierBadges();
-      return;
-    }
-    const composer = codexServiceTierFindComposerEl();
-    const placement = composer ? codexServiceTierBadgePlacement(composer) : null;
-    const existingBadges = Array.from(document.querySelectorAll(`[data-codex-service-tier-badge="true"]`));
-    if (!composer || !placement?.parent) {
-      existingBadges.forEach((badge) => badge.remove());
-      return;
-    }
-    let badge = existingBadges.find((node) => node.closest?.(".composer-footer") || node.closest?.("button") == null) || existingBadges[0];
-    existingBadges.forEach((node) => {
-      if (node !== badge) node.remove();
-    });
-    if (!badge || badge.dataset.codexServiceTierBadgeVersion !== codexServiceTierBadgeVersion) {
-      badge?.remove();
-      badge = document.createElement("span");
-      badge.className = codexServiceTierBadgeClass;
-      badge.dataset.codexServiceTierBadge = "true";
-      badge.dataset.codexServiceTierBadgeVersion = codexServiceTierBadgeVersion;
-    }
-    wireCodexServiceTierBadge(badge);
-    const before = placement.before?.parentElement === placement.parent ? placement.before : null;
-    if (badge.parentElement !== placement.parent || badge.nextSibling !== before) {
-      placement.parent.insertBefore(badge, before);
-    }
-    refreshCodexServiceTierBadges();
-  }
-
-  function removeCodexServiceTierBadges() {
+  function removeLegacyCodexServiceTierBadges() {
     document.querySelectorAll(`[data-codex-service-tier-badge="true"]`).forEach((badge) => badge.remove());
   }
 
@@ -880,8 +937,22 @@
   }
 
   function conversationViewResolveTargets() {
-    if (!conversationViewState.contentEl?.isConnected) conversationViewState.contentEl = conversationViewFindContentEl();
-    if (!conversationViewState.composerEl?.isConnected) conversationViewState.composerEl = conversationViewFindComposerEl();
+    for (const [key, next] of [
+      ["contentEl", conversationViewFindContentEl()],
+      ["composerEl", conversationViewFindComposerEl()],
+    ]) {
+      const previous = conversationViewState[key];
+      if (previous && previous !== next) {
+        conversationViewRestoreElement(previous);
+        conversationViewState.elements.delete(previous);
+        [previous, previous.parentElement, previous.parentElement?.parentElement].forEach((el) => {
+          if (!el) return;
+          conversationViewState.ro?.unobserve?.(el);
+          conversationViewState.observed.delete(el);
+        });
+      }
+      conversationViewState[key] = next;
+    }
     [
       document.documentElement,
       document.body,
@@ -989,4 +1060,3 @@
   }
 
   window.__codexPlusConversationViewCleanup = cleanupConversationView;
-

@@ -1,9 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use super::{
-    InstallOptions, MANAGER_BINARY, MANAGER_NAME, SILENT_BINARY, SILENT_NAME,
-    install_root_or_default, option_or_current_exe,
-};
+use super::{APP_NAME, InstallOptions, application_source, install_root_or_default};
 
 const UNINSTALL_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexPlusPlus";
 const LEGACY_UNINSTALL_SUBKEY: &str =
@@ -31,8 +28,8 @@ pub struct WindowsEntrypointPlan {
 
 pub fn build_windows_entrypoint_plan(options: &InstallOptions) -> WindowsEntrypointPlan {
     let install_root = install_root_or_default(options);
-    let launcher_path = option_or_current_exe(&options.launcher_path, SILENT_BINARY);
-    let manager_path = option_or_current_exe(&options.manager_path, MANAGER_BINARY);
+    let launcher_path = application_source(options);
+    let manager_path = launcher_path.clone();
     let icon_path = default_icon_path();
     let install_location = manager_path
         .parent()
@@ -47,7 +44,7 @@ pub fn build_windows_entrypoint_plan(options: &InstallOptions) -> WindowsEntrypo
             .to_string_lossy()
             .to_string(),
         manager_shortcut: install_root
-            .join("Codex++ 管理工具.lnk")
+            .join("Codex++.lnk")
             .to_string_lossy()
             .to_string(),
         install_root: install_root.to_string_lossy().to_string(),
@@ -68,48 +65,61 @@ pub fn build_windows_entrypoint_plan(options: &InstallOptions) -> WindowsEntrypo
 #[cfg(windows)]
 pub fn install_shortcuts(options: &InstallOptions) -> anyhow::Result<()> {
     let plan = build_windows_entrypoint_plan(options);
+    // 必须在写入本轮卸载登记之前读取：图标缺失可能是用户主动删除，而非首次安装。
+    let already_installed =
+        has_existing_installation(crate::windows_integration::read_current_user_string_values)?;
     let install_root = PathBuf::from(&plan.install_root);
     std::fs::create_dir_all(&install_root)?;
-    // 桌面图标只在不存在时创建（issue #2376）：用户删掉图标后，覆盖升级/修复
-    // 安装不该把它加回来。与 NSIS 段的 IfFileExists 判断保持一致，否则经
-    // 管理器触发的那条安装路径仍会把图标重新堆到桌面上。
-    create_desktop_shortcut_if_absent(
-        PathBuf::from(&plan.silent_shortcut),
-        PathBuf::from(&plan.launcher_path),
-        "Launch Codex++ silently",
-        PathBuf::from(&plan.silent_icon_path),
-    )?;
-    create_desktop_shortcut_if_absent(
-        PathBuf::from(&plan.manager_shortcut),
-        PathBuf::from(&plan.manager_path),
-        "Open Codex++ management tool",
-        PathBuf::from(&plan.manager_icon_path),
+    // 与 NSIS 同步：仅首次安装补桌面图标；升级/修复保留现状（issue #2376）。
+    create_desktop_shortcut_on_first_install(
+        Path::new(&plan.silent_shortcut),
+        already_installed,
+        || {
+            create_entrypoint_shortcut(
+                PathBuf::from(&plan.silent_shortcut),
+                PathBuf::from(&plan.launcher_path),
+                "Open Codex++",
+                PathBuf::from(&plan.silent_icon_path),
+            )
+        },
     )?;
     register_url_protocol(&plan.manager_path)?;
     write_uninstall_registration(&plan)?;
     Ok(())
 }
 
-/// 桌面入口专用：目标已存在就原样保留，避免覆盖升级把用户删掉的图标加回来。
-/// 开始菜单入口不走这条，缺失会让人找不到程序。
-#[cfg(windows)]
-fn create_desktop_shortcut_if_absent(
-    path: PathBuf,
-    target: PathBuf,
-    description: &str,
-    icon: PathBuf,
+#[cfg(any(windows, test))]
+fn has_existing_installation(
+    mut read_values: impl FnMut(&str) -> anyhow::Result<Vec<(String, Option<String>)>>,
+) -> anyhow::Result<bool> {
+    for key in [UNINSTALL_SUBKEY, LEGACY_UNINSTALL_SUBKEY] {
+        if read_values(key)?.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("InstallLocation")
+                && value.as_ref().is_some_and(|value| !value.is_empty())
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 仅首次安装补建；后续缺失说明用户选择了无桌面图标，不能用缺失判定首次安装。
+#[cfg(any(windows, test))]
+fn create_desktop_shortcut_on_first_install(
+    path: &Path,
+    already_installed: bool,
+    create: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    if path.exists() {
+    if already_installed || path.exists() {
         return Ok(());
     }
-    create_entrypoint_shortcut(path, target, description, icon)
+    create()
 }
 
 #[cfg(windows)]
 pub fn uninstall_shortcuts(options: &InstallOptions) -> anyhow::Result<()> {
     let plan = build_windows_entrypoint_plan(options);
     let _ = std::fs::remove_file(&plan.silent_shortcut);
-    let _ = std::fs::remove_file(&plan.manager_shortcut);
     let _ = crate::windows_integration::delete_current_user_key(&format!(
         r"{URL_PROTOCOL_SUBKEY}\shell\open\command"
     ));
@@ -173,7 +183,7 @@ fn write_uninstall_registration(plan: &WindowsEntrypointPlan) -> anyhow::Result<
         .to_string_lossy()
         .to_string();
     for (name, value) in [
-        ("DisplayName", "Codex++".to_string()),
+        ("DisplayName", APP_NAME.to_string()),
         ("DisplayVersion", crate::version::VERSION.to_string()),
         ("Publisher", "BigPizzaV3".to_string()),
         ("DisplayIcon", plan.manager_icon_path.clone()),
@@ -226,5 +236,83 @@ fn default_icon_path() -> PathBuf {
 
 #[allow(dead_code)]
 fn _entrypoint_names() -> (&'static str, &'static str) {
-    (SILENT_NAME, MANAGER_NAME)
+    (APP_NAME, APP_NAME)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deleted_desktop_shortcuts_stay_absent_on_upgrade_or_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let desktop = root.path().join("Desktop");
+        std::fs::create_dir(&desktop).unwrap();
+        // 安装记录来自另一个目录；空桌面不代表首次安装。
+        let installed = has_existing_installation(|key| {
+            Ok(if key == UNINSTALL_SUBKEY {
+                vec![("InstallLocation".into(), Some("C:/Programs/Codex++".into()))]
+            } else {
+                Vec::new()
+            })
+        })
+        .unwrap();
+        for name in ["Codex++.lnk", "Codex++ 管理工具.lnk"] {
+            let shortcut = desktop.join(name);
+            create_desktop_shortcut_on_first_install(&shortcut, installed, || {
+                std::fs::write(&shortcut, b"new shortcut")?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(!shortcut.exists());
+        }
+    }
+
+    #[test]
+    fn first_install_creates_missing_shortcuts_and_preserves_existing_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let installed = has_existing_installation(|_| Ok(Vec::new())).unwrap();
+        let shortcut = root.path().join("Codex++.lnk");
+        create_desktop_shortcut_on_first_install(&shortcut, installed, || {
+            std::fs::write(&shortcut, b"original shortcut")?;
+            Ok(())
+        })
+        .unwrap();
+        create_desktop_shortcut_on_first_install(&shortcut, installed, || {
+            std::fs::write(&shortcut, b"replacement shortcut")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&shortcut).unwrap(), b"original shortcut");
+    }
+
+    #[test]
+    fn legacy_installation_registration_also_preserves_a_clean_desktop() {
+        let root = tempfile::tempdir().unwrap();
+        let installed = has_existing_installation(|key| {
+            Ok(if key == LEGACY_UNINSTALL_SUBKEY {
+                vec![("InstallLocation".into(), Some("C:/Programs/Codex++".into()))]
+            } else {
+                Vec::new()
+            })
+        })
+        .unwrap();
+        let shortcut = root.path().join("Codex++.lnk");
+        create_desktop_shortcut_on_first_install(&shortcut, installed, || {
+            std::fs::write(&shortcut, b"unwanted shortcut")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!shortcut.exists());
+    }
+
+    #[test]
+    fn empty_install_location_does_not_block_first_install() {
+        assert!(
+            !has_existing_installation(|_| {
+                Ok(vec![("InstallLocation".into(), Some(String::new()))])
+            })
+            .unwrap()
+        );
+    }
 }

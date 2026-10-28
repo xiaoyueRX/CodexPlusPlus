@@ -2,6 +2,7 @@ import { DEFAULT_AUTO_COMPACT_PERCENT, normalizeAutoCompactPercent } from "./aut
 
 export type ModelMetadata = Record<string, unknown>;
 export type ModelMetadataMap = Record<string, ModelMetadata>;
+export type ModelFastSupportMode = "inherit" | "supported" | "unsupported";
 
 export type ImportedModelMetadata = {
   slug: string;
@@ -435,7 +436,9 @@ export function metadataSourceTags(options: {
 export type ModelRowSyncPatch = { window?: string; autoCompact?: string };
 
 /// 导入文档解析结果 → 模型行补丁（JSON→行 的实时写回规则）：
-/// - 窗口：解析出有效值且与行现值不同才写（相同不写，避免多余 state 更新）
+/// - 窗口：**只补空列**。手工填过的窗口是显式覆盖层，导入文档不能把它换掉
+///   （曾出现「配好 1M 的模型，粘贴供应商 models.json 后被上游 256K 覆盖」）；
+///   想用文档的值就先把行内窗口清空。
 /// - 压缩比：解析出显示值且与行现值不同才写；null（JSON 未声明）不动行，
 ///   避免粘贴别的模型 JSON 时清掉用户行里的值
 export function importDocumentSyncPatch(
@@ -443,7 +446,7 @@ export function importDocumentSyncPatch(
   preview: { contextWindow: string | null; autoCompactPercent: string | null },
 ): ModelRowSyncPatch {
   const patch: ModelRowSyncPatch = {};
-  if (preview.contextWindow && preview.contextWindow !== row.window) {
+  if (preview.contextWindow && !row.window.trim()) {
     patch.window = preview.contextWindow;
   }
   if (preview.autoCompactPercent && preview.autoCompactPercent !== row.autoCompact) {
@@ -694,6 +697,67 @@ function documentCandidates(root: unknown): ModelMetadata[] | null {
   return null;
 }
 
+function speedTierIs(value: unknown, id: string): boolean {
+  const tier = typeof value === "string" ? value : isRecord(value) ? value.id : null;
+  return typeof tier === "string" && tier.trim().toLowerCase() === id;
+}
+
+/** 显式空数组表示禁用；缺失字段才表示继承，不能从模型名称猜测 Fast 能力。 */
+export function modelFastSupportMode(metadata: ModelMetadata | null | undefined): ModelFastSupportMode {
+  const mode = metadata?.codex_plus_fast_support;
+  if (mode === "inherit" || mode === "supported" || mode === "unsupported") return mode;
+  if (Array.isArray(metadata?.service_tiers)) {
+    return metadata.service_tiers.some((tier) => speedTierIs(tier, "priority")) ? "supported" : "unsupported";
+  }
+  if (Array.isArray(metadata?.additional_speed_tiers)) {
+    return metadata.additional_speed_tiers.some((tier) => speedTierIs(tier, "fast")) ? "supported" : "unsupported";
+  }
+  return "inherit";
+}
+
+/** 独立声明 Fast 模式，不修改供应商原始档位；继承可以完整恢复原始能力。 */
+export function setModelFastSupportMode(metadata: ModelMetadata, mode: ModelFastSupportMode): ModelMetadata {
+  return { ...metadata, codex_plus_fast_support: mode };
+}
+
+/** 在当前导入草稿中修改能力；不写 profile，取消仍沿用原有草稿回滚。 */
+export function synchronizeModelMetadataFastSupport(
+  source: string,
+  targetSlug: string,
+  mode: ModelFastSupportMode,
+): { document: string; preview: ImportedModelMetadata } | null {
+  let root: unknown;
+  try {
+    root = source.trim() ? JSON.parse(unwrapJsonCompatibleDocument(source))
+      : { models: [{ slug: modelSlugFromRowName(targetSlug) }] };
+  } catch { return null; }
+  const matches = documentCandidates(root)?.filter((entry) => slugMatchesIgnoreCase(entry.slug, targetSlug));
+  if (!matches || matches.length !== 1) return null;
+  const next = setModelFastSupportMode(matches[0], mode);
+  Object.assign(matches[0], next);
+  const document = JSON.stringify(root, null, 2);
+  const parsed = parseModelMetadataDocument(document, targetSlug);
+  return parsed.ok ? { document, preview: parsed.value } : null;
+}
+
+/** 只改目标模型的 Lite 声明，保留同一导入文档的其它模型与未知字段。 */
+export function synchronizeModelMetadataLiteSupport(
+  source: string, targetSlug: string, mode: "inherit" | "supported" | "unsupported",
+): { document: string; preview: ImportedModelMetadata } | null {
+  let root: unknown;
+  try {
+    root = source.trim() ? JSON.parse(unwrapJsonCompatibleDocument(source))
+      : { models: [{ slug: modelSlugFromRowName(targetSlug) }] };
+  } catch { return null; }
+  const matches = documentCandidates(root)?.filter((entry) => slugMatchesIgnoreCase(entry.slug, targetSlug));
+  if (!matches || matches.length !== 1) return null;
+  if (mode === "inherit") delete matches[0].use_responses_lite;
+  else matches[0].use_responses_lite = mode === "supported";
+  const document = JSON.stringify(root, null, 2);
+  const parsed = parseModelMetadataDocument(document, targetSlug);
+  return parsed.ok ? { document, preview: parsed.value } : null;
+}
+
 // 强制管理字段顺序，避免保存后 context_window 跑到压缩字段之后。
 function reorderManagedModelFields(model: ModelMetadata): void {
   const ordered: ModelMetadata = {};
@@ -805,6 +869,12 @@ function positiveIntegerString(value: unknown): string | null {
 }
 
 export function validateModelCapabilities(metadata: ModelMetadata): string | null {
+  if (Object.hasOwn(metadata, "base_instructions") && typeof metadata.base_instructions !== "string") {
+    return "base_instructions 必须是字符串（允许空字符串）。";
+  }
+  if (Object.hasOwn(metadata, "supports_parallel_tool_calls") && typeof metadata.supports_parallel_tool_calls !== "boolean") {
+    return "supports_parallel_tool_calls 必须是 true 或 false。";
+  }
   if (Object.hasOwn(metadata, "supported_reasoning_levels")) {
     if (!Array.isArray(metadata.supported_reasoning_levels)) {
       return "supported_reasoning_levels 必须是数组。";

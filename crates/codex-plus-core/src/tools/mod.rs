@@ -6,15 +6,16 @@
 //! （Grok / Claude Code / …）预留同名分片。迁移是纯增量的 —— 扁平字段不删、
 //! 不改名、继续序列化，所以老版本管理器读新文件照常工作。
 //!
-//! 每个工具的写盘适配放各自的子模块，见 [`grok`]。
+//! 每个工具的写盘适配放各自的子模块，见 [`grok`]、[`claude`]。
 
+pub mod claude;
 pub mod grok;
 
 use std::path::PathBuf;
 
 use crate::settings::{
-    AggregateRelayProfile, BackendSettings, RelayProfile, default_active_relay_id,
-    default_relay_test_model,
+    default_active_relay_id, default_relay_test_model, AggregateRelayProfile, BackendSettings,
+    RelayProfile,
 };
 
 /// 工具标识。`Unknown` 兜底任何本版本还不认识的值，保证前向兼容：
@@ -23,6 +24,7 @@ use crate::settings::{
 pub enum ToolId {
     Codex,
     Grok,
+    Claude,
     Unknown(String),
 }
 
@@ -37,6 +39,7 @@ impl ToolId {
         match self {
             Self::Codex => "codex",
             Self::Grok => "grok",
+            Self::Claude => "claude",
             Self::Unknown(value) => value.as_str(),
         }
     }
@@ -45,6 +48,7 @@ impl ToolId {
         match value.trim() {
             "codex" => Self::Codex,
             "grok" => Self::Grok,
+            "claude" => Self::Claude,
             other => Self::Unknown(other.to_string()),
         }
     }
@@ -111,22 +115,36 @@ pub struct ToolSpec {
     pub name: String,
     /// 该工具的配置根目录（Codex 是 CODEX_HOME，Grok 是 ~/.grok）。
     pub home_dir: String,
-    /// 供应商配置写入能力是否已经接好。未接好的工具在 UI 上可见但不可切。
+    /// 是否可以在管理器中打开该工具的管理页。
     pub switchable: bool,
 }
 
 pub const TOOL_CODEX_NAME: &str = "Codex";
 pub const TOOL_GROK_NAME: &str = "Grok";
+pub const TOOL_CLAUDE_NAME: &str = "Claude Code";
 
-/// 已注册的工具，顺序即 UI 顶栏顺序。
-pub const REGISTERED_TOOLS: &[ToolId] = &[ToolId::Codex, ToolId::Grok];
+/// 已注册的工具，顺序即 UI 顶栏顺序：Codex、Claude、Grok。
+pub const REGISTERED_TOOLS: &[ToolId] = &[ToolId::Codex, ToolId::Claude, ToolId::Grok];
 
 pub fn tool_display_name(id: &ToolId) -> &'static str {
     match id {
         ToolId::Codex => TOOL_CODEX_NAME,
         ToolId::Grok => TOOL_GROK_NAME,
+        ToolId::Claude => TOOL_CLAUDE_NAME,
         ToolId::Unknown(_) => "未知工具",
     }
+}
+
+/// Claude Code 的配置根目录（默认 `~/.claude`，可用 `CLAUDE_CONFIG_DIR` 覆盖）。
+pub fn default_claude_home_dir() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty() && !path.to_string_lossy().trim().is_empty())
+        .unwrap_or_else(|| {
+            directories::BaseDirs::new()
+                .map(|dirs| dirs.home_dir().join(".claude"))
+                .unwrap_or_else(|| PathBuf::from(".claude"))
+        })
 }
 
 /// 供应商 profile 的写入目标目录。
@@ -134,6 +152,7 @@ pub fn tool_home_dir(id: &ToolId) -> PathBuf {
     match id {
         ToolId::Codex => crate::relay_config::default_codex_home_dir(),
         ToolId::Grok => crate::grok_config::default_grok_home_dir(),
+        ToolId::Claude => default_claude_home_dir(),
         // 未注册的工具没有已知 home，退回配置根目录，避免调用方拿到 panic。
         ToolId::Unknown(_) => crate::paths::default_app_state_dir(),
     }
@@ -141,7 +160,8 @@ pub fn tool_home_dir(id: &ToolId) -> PathBuf {
 
 /// 该工具的 profile 是否已经能真正写盘并切换。
 pub fn tool_is_switchable(id: &ToolId) -> bool {
-    matches!(id, ToolId::Codex | ToolId::Grok)
+    // Claude 的供应商存在独立的 claude-providers.json，见 [`claude`]。
+    matches!(id, ToolId::Codex | ToolId::Grok | ToolId::Claude)
 }
 
 pub fn tool_specs() -> Vec<ToolSpec> {
@@ -219,7 +239,7 @@ mod tests {
 
     #[test]
     fn tool_id_round_trips_through_json() {
-        for id in [ToolId::Codex, ToolId::Grok] {
+        for id in [ToolId::Codex, ToolId::Grok, ToolId::Claude] {
             let encoded = serde_json::to_string(&id).unwrap();
             assert_eq!(encoded, format!("\"{}\"", id.as_str()));
             let decoded: ToolId = serde_json::from_str(&encoded).unwrap();
@@ -229,10 +249,10 @@ mod tests {
 
     #[test]
     fn unknown_tool_id_survives_round_trip() {
-        let decoded: ToolId = serde_json::from_str("\"claude\"").unwrap();
-        assert_eq!(decoded, ToolId::Unknown("claude".to_string()));
+        let decoded: ToolId = serde_json::from_str("\"gemini\"").unwrap();
+        assert_eq!(decoded, ToolId::Unknown("gemini".to_string()));
         // 关键：未知工具再序列化回去必须还是原字符串，不能退化成 null / 丢失。
-        assert_eq!(serde_json::to_string(&decoded).unwrap(), "\"claude\"");
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), "\"gemini\"");
     }
 
     #[test]
@@ -313,8 +333,12 @@ mod tests {
         assert_eq!(specs[0].id, ToolId::Codex);
         assert_eq!(specs[0].name, TOOL_CODEX_NAME);
         assert!(specs[0].switchable);
-        assert_eq!(specs[1].id, ToolId::Grok);
+        // Claude 排在第二位：工具条上的位置是明确要求过的，别随手调回去。
+        assert_eq!(specs[1].id, ToolId::Claude);
+        assert_eq!(specs[1].name, TOOL_CLAUDE_NAME);
         assert!(specs[1].switchable);
+        assert_eq!(specs[2].id, ToolId::Grok);
+        assert!(specs[2].switchable);
         assert!(specs.iter().all(|spec| !spec.home_dir.is_empty()));
     }
 }

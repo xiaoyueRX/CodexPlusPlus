@@ -15,10 +15,10 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, oneshot};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -44,6 +44,24 @@ fn bridge_script_defines_expected_globals_and_binding() {
     assert!(script.contains("previousCallbacks"));
     assert!(script.contains("桥接已重新连接"));
     assert!(script.contains("Number.isFinite(window.__codexSessionDeleteSeq)"));
+}
+
+#[test]
+fn dictation_renderer_contract_harness() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("core crate should live under crates/codex-plus-core");
+    let output = Command::new("node")
+        .arg(repo.join("assets/inject/dictation.test.cjs"))
+        .output()
+        .expect("node should run the dictation renderer contract harness");
+    assert!(
+        output.status.success(),
+        "dictation harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -95,16 +113,12 @@ fn injection_script_retries_sidebar_nav_after_startup() {
     assert!(script.contains("attempts > 20"));
 }
 
-/// 内置插件包的注册名从 openai-curated-remote 换成了 codex-plus-curated
-/// （前者是 codex 保留名，注册后会被静默忽略）。显示名映射要跟着认新名，
-/// 否则插件市场里会显示原始名而不是友好名。
+/// 原生返回的既有旧配置继续使用友好显示名，不重新注入或注册插件市场。
 #[test]
-fn injection_script_maps_the_renamed_bundled_marketplace_display_name() {
+fn injection_script_preserves_legacy_native_marketplace_display_names() {
     let script = assets::injection_script(57321);
 
-    assert!(
-        script.contains(r#"name === "codex-plus-curated" || name === "openai-curated-remote""#)
-    );
+    assert!(script.contains(r#"name === "codex-plus-curated" || name === "openai-curated-remote""#));
     assert!(script.contains("OpenAI插件5(Codex++)"));
 }
 
@@ -118,7 +132,32 @@ fn injection_script_omits_stepwise_runtime_when_disabled() {
     let script = assets::injection_script_with_settings(57321, &settings);
 
     assert!(!script.contains("const API_KEY = \"__codexStepwisePanel\";"));
-    assert!(script.contains("data-codex-plus-setting=\"stepwise\""));
+    assert_codex_setting_row(&script, "codexAppStepwiseEnabled", "stepwise");
+}
+
+/// Codex 设置页的设置行按 /settings/catalog 清单生成：断言清单让该项在 Codex 显示，
+/// 并且注入脚本能把清单 key 映射回本页的设置 key（生成 data-codex-plus-setting）。
+fn assert_codex_setting_row(script: &str, backend_key: &str, local_key: &str) -> serde_json::Value {
+    let catalog = codex_plus_core::settings_catalog::enhancement_settings_catalog().unwrap();
+    let item = catalog["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["key"] == backend_key)
+        .cloned()
+        .unwrap_or_else(|| panic!("{backend_key} 不在设置项清单里"));
+    assert!(
+        item["surfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|surface| surface == "codex"),
+        "{backend_key} 应在 Codex 设置页显示"
+    );
+    assert!(script.contains(&format!("{local_key}: \"{backend_key}\"")));
+    assert!(script.contains(r#"data-codex-plus-setting="${escapeHtml(localKey)}""#));
+    assert!(script.contains(r#"postJson("/settings/catalog", {})"#));
+    item
 }
 
 #[test]
@@ -195,12 +234,20 @@ fn stepwise_script_composes_one_runtime_from_separate_fragments() {
 }
 
 #[test]
-fn pet_real_mouse_settings_are_gated_to_windows_in_injected_ui() {
+fn pet_real_mouse_settings_are_shown_on_windows_and_mac_in_injected_ui() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("codexPlusIsWindowsPlatform"));
+    assert!(script.contains("codexPlusIsMacPlatform"));
     assert!(script.contains(r#"/\bWindows\b/i.test(navigator.userAgent || "")"#));
-    assert!(script.contains("codexPlusIsWindowsPlatform ? `<div"));
+    assert!(script.contains(r#"/\bMacintosh\b/i.test(navigator.userAgent || "")"#));
+    // 平台限制写在设置项清单里，注入页按当前平台过滤。
+    let item = assert_codex_setting_row(&script, "codexAppPetRealMouseLook", "petRealMouseLook");
+    assert_eq!(item["platforms"], json!(["windows", "macos"]));
+    assert!(script.contains(
+        r#"codexPlusIsWindowsPlatform ? "windows" : codexPlusIsMacPlatform ? "macos" : "linux""#
+    ));
+    assert!(!script.contains("codexPlusIsWindowsPlatform ? `<div"));
 }
 
 #[test]
@@ -354,143 +401,66 @@ fn pet_real_mouse_capability_probe_rejects_v1_without_explicit_v2_evidence() {
 }
 
 #[test]
-fn pet_real_mouse_update_script_stops_when_runtime_capability_is_missing() {
-    let script = assets::pet_real_mouse_update_script(-125, 640);
-
-    assert!(script.contains("data-avatar-mascot"));
-    assert!(script.contains("image.naturalWidth === 1536"));
-    assert!(script.contains("image.naturalHeight === 2288"));
-    assert!(script.contains("getComputedStyle(element).backgroundImage"));
-    assert!(script.contains("await image.decode()"));
-    assert!(script.contains("__codexPlusPetV2SpriteProbe"));
-    assert!(script.contains("updateScreenPoint?.({ x: -125, y: 640 }) === true"));
+fn pet_real_mouse_hook_probe_only_checks_update_screen_point() {
+    let probe = assets::pet_real_mouse_hook_probe_script();
+    assert!(probe.contains("__codexPlusPetRealMouseLook?.updateScreenPoint"));
+    assert!(!probe.contains("isV2Sprite"));
+    assert!(!probe.contains("vscode-api"));
+    assert!(!probe.contains("/pet/cursor-position"));
 }
 
 #[test]
-fn pet_real_mouse_update_script_accepts_png_webp_and_blob_v2_but_rejects_v1() {
+fn pet_real_mouse_update_script_stops_when_runtime_capability_is_missing() {
+    let script = assets::pet_real_mouse_update_script(-125, 640);
+
+    assert!(script.contains("updateScreenPoint?.({ x: -125, y: 640 }) === true"));
+    assert!(!script.contains("isV2Sprite"));
+    assert!(!script.contains("data-avatar-mascot"));
+    assert!(!script.contains("__codexPlusPetV2SpriteProbe"));
+    assert!(!script.contains("/pet/cursor-position"));
+    assert!(!script.contains("fetch("));
+}
+
+#[test]
+fn pet_real_mouse_update_script_calls_hook_without_v2_or_http() {
     let temp = tempfile::tempdir().expect("temp dir should be created");
-    let script_path = temp.path().join("pet-update.js");
-    let harness_path = temp.path().join("pet-update-harness.cjs");
-    std::fs::write(&script_path, assets::pet_real_mouse_update_script(120, 240))
-        .expect("pet update script should be written");
-    let mut harness = std::fs::File::create(&harness_path).expect("harness should be created");
-    write!(
-        harness,
-        r#"
-const fs = require("fs");
-const vm = require("vm");
-const script = fs.readFileSync({script_path}, "utf8");
-const sources = {{
-  pngV2: "data:image/png;base64,png-v2",
-  webpV2: "data:image/webp;base64,webp-v2",
-  webpV1: "data:image/webp;base64,webp-v1",
-  blobV2: "blob:codex-plus-pet-v2",
-  unknown: "data:image/webp;base64,unknown",
-}};
-const dimensions = new Map([
-  [sources.pngV2, [1536, 2288]],
-  [sources.webpV2, [1536, 2288]],
-  [sources.webpV1, [1536, 1872]],
-  [sources.blobV2, [1536, 2288]],
-]);
-async function run({{ image = null, source = null }} = {{}}) {{
-  let calls = 0;
-  let decodes = 0;
-  const element = {{ querySelectorAll: () => [] }};
-  const mascot = {{
-    querySelectorAll: (selector) => selector === "img" && image ? [image] : [element],
-  }};
-  class MockImage {{
-    set src(value) {{ this.source = value; }}
-    async decode() {{
-      decodes += 1;
-      const size = dimensions.get(this.source);
-      if (!size) throw new Error("unsupported image");
-      [this.naturalWidth, this.naturalHeight] = size;
-    }}
-  }}
+    let harness_path = temp.path().join("pet-real-mouse-update-hook.cjs");
+    std::fs::write(
+        &harness_path,
+        format!(
+            r#"
+const vm = require("node:vm");
+const script = {script};
+function run(hasHook) {{
+  const state = {{ calls: 0, point: null }};
   const context = {{
-    document: {{ querySelector: () => mascot }},
-    getComputedStyle: (target) => ({{ backgroundImage: target === element && source ? `url("${{source}}")` : "none" }}),
-    Image: MockImage,
-    window: {{ __codexPlusPetRealMouseLook: {{ updateScreenPoint: () => {{ calls += 1; return true; }} }} }},
+    window: hasHook
+      ? {{
+          __codexPlusPetRealMouseLook: {{
+            updateScreenPoint: (point) => {{
+              state.calls += 1;
+              state.point = point;
+              return true;
+            }},
+          }},
+        }}
+      : {{}},
   }};
-  const result = await vm.runInNewContext(script, context);
-  return {{ result, calls, decodes }};
+  const result = vm.runInNewContext(script, context);
+  return {{ result, calls: state.calls, point: state.point }};
 }}
-async function runSwitchSequence() {{
-  let calls = 0;
-  let decodes = 0;
-  let source = sources.webpV2;
-  const element = {{ querySelectorAll: () => [] }};
-  const mascot = {{ querySelectorAll: () => [element] }};
-  class MockImage {{
-    set src(value) {{ this.source = value; }}
-    async decode() {{
-      decodes += 1;
-      [this.naturalWidth, this.naturalHeight] = dimensions.get(this.source);
-    }}
-  }}
-  const context = {{
-    document: {{ querySelector: () => mascot }},
-    getComputedStyle: (target) => ({{ backgroundImage: target === element ? `url("${{source}}")` : "none" }}),
-    Image: MockImage,
-    window: {{ __codexPlusPetRealMouseLook: {{ updateScreenPoint: () => {{ calls += 1; return true; }} }} }},
-  }};
-  const first = await vm.runInNewContext(script, context);
-  const cached = await vm.runInNewContext(script, context);
-  source = sources.webpV1;
-  const afterV1Switch = await vm.runInNewContext(script, context);
-  return {{ first, cached, afterV1Switch, calls, decodes }};
-}}
-async function runDecodeRace() {{
-  let calls = 0;
-  let source = sources.webpV2;
-  let finishDecode;
-  const element = {{ querySelectorAll: () => [] }};
-  const mascot = {{ querySelectorAll: () => [element] }};
-  class MockImage {{
-    set src(value) {{ this.source = value; }}
-    async decode() {{
-      await new Promise((resolve) => {{ finishDecode = resolve; }});
-      [this.naturalWidth, this.naturalHeight] = dimensions.get(this.source);
-    }}
-  }}
-  const context = {{
-    document: {{ querySelector: () => mascot }},
-    getComputedStyle: (target) => ({{ backgroundImage: target === element ? `url("${{source}}")` : "none" }}),
-    Image: MockImage,
-    window: {{ __codexPlusPetRealMouseLook: {{ updateScreenPoint: () => {{ calls += 1; return true; }} }} }},
-  }};
-  const pending = vm.runInNewContext(script, context);
-  source = sources.webpV1;
-  finishDecode();
-  return {{ result: await pending, calls }};
-}}
-(async () => {{
-  process.stdout.write(JSON.stringify({{
-    pngV2: await run({{ source: sources.pngV2 }}),
-    webpV2: await run({{ source: sources.webpV2 }}),
-    blobV2: await run({{ source: sources.blobV2 }}),
-    webpV1: await run({{ source: sources.webpV1 }}),
-    imgV2: await run({{ image: {{ naturalWidth: 1536, naturalHeight: 2288 }} }}),
-    unknown: await run({{ source: sources.unknown }}),
-    missing: await run(),
-    switchSequence: await runSwitchSequence(),
-    decodeRace: await runDecodeRace(),
-  }}));
-}})().catch((error) => {{ console.error(error); process.exitCode = 1; }});
+process.stdout.write(JSON.stringify({{ missing: run(false), present: run(true) }}));
 "#,
-        script_path = serde_json::to_string(&script_path.to_string_lossy().to_string())
-            .expect("script path should serialize")
+            script = serde_json::to_string(&assets::pet_real_mouse_update_script(42, -7))
+                .expect("update script should serialize"),
+        ),
     )
     .expect("harness should be written");
-    drop(harness);
 
     let output = Command::new("node")
         .arg(&harness_path)
         .output()
-        .expect("node should run pet update harness");
+        .expect("node should run pet update hook harness");
     assert!(
         output.status.success(),
         "node harness failed\nstdout:\n{}\nstderr:\n{}",
@@ -499,45 +469,12 @@ async function runDecodeRace() {{
     );
     let cases: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("harness stdout should be JSON");
-    assert_eq!(
-        cases["pngV2"],
-        json!({ "result": true, "calls": 1, "decodes": 1 })
-    );
-    assert_eq!(
-        cases["webpV2"],
-        json!({ "result": true, "calls": 1, "decodes": 1 })
-    );
-    assert_eq!(
-        cases["blobV2"],
-        json!({ "result": true, "calls": 1, "decodes": 1 })
-    );
-    assert_eq!(
-        cases["imgV2"],
-        json!({ "result": true, "calls": 1, "decodes": 0 })
-    );
-    assert_eq!(
-        cases["webpV1"],
-        json!({ "result": false, "calls": 0, "decodes": 1 })
-    );
-    assert_eq!(
-        cases["unknown"],
-        json!({ "result": false, "calls": 0, "decodes": 1 })
-    );
-    assert_eq!(
-        cases["missing"],
-        json!({ "result": false, "calls": 0, "decodes": 0 })
-    );
-    assert_eq!(
-        cases["switchSequence"],
-        json!({
-            "first": true,
-            "cached": true,
-            "afterV1Switch": false,
-            "calls": 2,
-            "decodes": 2
-        })
-    );
-    assert_eq!(cases["decodeRace"], json!({ "result": false, "calls": 0 }));
+    assert_eq!(cases["missing"]["result"], false);
+    assert_eq!(cases["missing"]["calls"], 0);
+    assert_eq!(cases["present"]["result"], true);
+    assert_eq!(cases["present"]["calls"], 1);
+    assert_eq!(cases["present"]["point"]["x"], 42);
+    assert_eq!(cases["present"]["point"]["y"], -7);
 }
 
 #[test]
@@ -591,22 +528,26 @@ fn official_login_usage_alert_setting_controls_renderer_injection() {
         }
     };
 
-    assert!(
-        assets::injection_script_with_settings(57321, &settings(RelayMode::Official, true, false))
-            .contains("window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = false;")
-    );
-    assert!(
-        assets::injection_script_with_settings(57321, &settings(RelayMode::Official, false, true))
-            .contains("window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = true;")
-    );
-    assert!(
-        assets::injection_script_with_settings(57321, &settings(RelayMode::Official, false, false))
-            .contains("window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = false;")
-    );
-    assert!(
-        assets::injection_script_with_settings(57321, &settings(RelayMode::PureApi, true, false))
-            .contains("window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = false;")
-    );
+    assert!(assets::injection_script_with_settings(
+        57321,
+        &settings(RelayMode::Official, true, false)
+    )
+    .contains("window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = false;"));
+    assert!(assets::injection_script_with_settings(
+        57321,
+        &settings(RelayMode::Official, false, true)
+    )
+    .contains("window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = true;"));
+    assert!(assets::injection_script_with_settings(
+        57321,
+        &settings(RelayMode::Official, false, false)
+    )
+    .contains("window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = false;"));
+    assert!(assets::injection_script_with_settings(
+        57321,
+        &settings(RelayMode::PureApi, true, false)
+    )
+    .contains("window.__CODEX_PLUS_HIDE_OFFICIAL_USAGE_ALERT__ = false;"));
 }
 
 #[test]
@@ -677,7 +618,7 @@ fn run_official_usage_status_harness() -> serde_json::Value {
 const scriptPath = {script_path};
 function node() {{
   return {{
-    appendChild() {{}}, prepend() {{}}, remove() {{}}, setAttribute() {{}}, removeAttribute() {{}},
+    appendChild() {{}}, prepend() {{}}, remove() {{}}, setAttribute() {{}}, removeAttribute() {{}}, toggleAttribute() {{}},
     addEventListener() {{}}, querySelector() {{ return null; }}, querySelectorAll() {{ return []; }},
     closest() {{ return null; }}, getAttribute() {{ return null; }},
     classList: {{ add() {{}}, remove() {{}}, toggle() {{}}, contains() {{ return false; }} }},
@@ -871,8 +812,25 @@ process.exit(0);
 fn injection_script_installs_image_overlay_from_data_uri() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("const source = config.dataUrl || \"\""));
-    assert!(script.contains("backgroundImage: `url(\"${source.replace(/\"/g, \"%22\")}\")`"));
+    assert!(script.contains("typeof config.dataUrl === \"string\""));
+    assert!(script.contains("overlay.id = codexPlusImageOverlayId"));
+    let overlay_script = script
+        .split("function installCodexPlusImageOverlay()")
+        .nth(1)
+        .and_then(|body| body.split("function scheduleCodexPlusImageOverlay()").next())
+        .expect("image overlay entry point should be embedded");
+    assert!(overlay_script.contains("data-codex-plus-image-native"));
+    assert!(overlay_script.contains("root.insertBefore(overlay, document.body"));
+    assert!(!overlay_script.contains("maskImage"));
+    assert!(!overlay_script.contains("ScrollTimeline"));
+    assert!(!overlay_script.contains("cloneNode"));
+    assert!(script.contains("URL.createObjectURL(new Blob([bytes], { type: data[1] }))"));
+    assert!(script.contains("image.src = resource.imageSource"));
+    assert!(!script.contains("JSON.stringify(source)"));
+    assert!(overlay_script.contains("zIndex: String(wallpaperLayer)"));
+    assert!(script.contains("pointerEvents: \"none\""));
+    assert!(!script.contains("codexPlusImageOverlayTransparentTargetSelector"));
+    assert!(!script.contains("function installCodexPlusImageOverlayForeground"));
     assert!(script.contains(
         "fit: { size: \"contain\", position: \"center center\", repeat: \"no-repeat\" }"
     ));
@@ -1082,10 +1040,8 @@ fn injection_script_fetches_ads_without_bridge() {
     assert!(script.contains("directFetchCodexPlusAds"));
     assert!(script.contains("cacheBustCodexPlusAdUrl"));
     assert!(script.contains("Date.now()"));
-    assert!(script.contains("BigPizzaV3/Ad-List"));
-    assert!(
-        !script.contains("codexPlusAds = normalizeCodexPlusAds(await postJson(\"/ads\", {}));")
-    );
+    assert!(script.contains("ads.codexpp.cc/ads.json"));
+    assert!(!script.contains("codexPlusAds = normalizeCodexPlusAds(await postJson(\"/ads\", {}));"));
 }
 
 #[test]
@@ -1165,18 +1121,25 @@ runCase(2, 99, 1, {{ timers: 1, clears: 1, checks: 1 }});
 }
 
 #[test]
-fn injection_script_explains_plugin_patch_is_unneeded_in_relay_mode() {
+fn injection_script_uses_one_enhancement_behavior() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("兼容增强模式下无需开启"));
+    assert!(!script.contains("兼容增强"));
+    assert!(!script.contains("完整增强"));
+    assert!(!script.contains("data-relay-unneeded"));
+    assert!(!script.contains("codexPlusBackendSettings.launchMode"));
 }
 
 #[test]
 fn injection_script_menu_exposes_marketplace_plugin_switch_only() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("插件市场解锁"));
-    assert!(script.contains("data-codex-plus-setting=\"pluginMarketplaceUnlock\""));
+    let item = assert_codex_setting_row(
+        &script,
+        "codexAppPluginMarketplaceUnlock",
+        "pluginMarketplaceUnlock",
+    );
+    assert_eq!(item["title"], "插件市场解锁");
     assert!(!script.contains("特殊插件强制安装"));
     assert!(!script.contains("data-codex-plus-setting=\"forcePluginInstall\""));
     assert!(!script.contains("forcePluginInstall"));
@@ -1195,7 +1158,7 @@ fn injection_script_menu_exposes_stepwise_switch_and_syncs_panel() {
     assert!(script.contains("stepwise: false"));
     assert!(script.contains("stepwise: \"codexAppStepwiseEnabled\""));
     assert!(script.contains("Stepwise"));
-    assert!(script.contains("data-codex-plus-setting=\"stepwise\""));
+    assert_codex_setting_row(&script, "codexAppStepwiseEnabled", "stepwise");
     assert!(script.contains("function syncStepwisePanel"));
     assert!(script.contains("window.__codexStepwisePanel?.syncSettings"));
     assert!(script.contains("if (key === \"stepwise\") syncStepwisePanel(value)"));
@@ -1225,10 +1188,8 @@ fn stepwise_keeps_settings_sync_alive_when_features_are_disabled() {
     assert!(script.contains("function scheduleSettingsSync("));
     assert!(script.contains("await reloadSettings();"));
     assert!(script.contains("scheduleSettingsSync();"));
-    assert!(
-        script
-            .contains("if (state.settingsSyncTimer) window.clearTimeout(state.settingsSyncTimer);")
-    );
+    assert!(script
+        .contains("if (state.settingsSyncTimer) window.clearTimeout(state.settingsSyncTimer);"));
     assert!(!script.contains("function stopRuntime() {\n    if (state.settingsSyncTimer)"));
 }
 
@@ -1324,11 +1285,8 @@ fn stepwise_manual_mode_waits_for_refresh_while_auto_mode_reuses_successful_cach
         "if (generationMode === \"manual\" && !manualResultVisible && !manualRequestPending) {"
     ));
     assert!(script.contains("} else if (manualRequestPending) {"));
-    assert!(
-        script.contains(
-            "if (normalizedMode === \"manual\" && options.userInitiated !== true) return;"
-        )
-    );
+    assert!(script
+        .contains("if (normalizedMode === \"manual\" && options.userInitiated !== true) return;"));
     assert!(script.contains("state.bridgeStatus = \"manual-ready\";"));
     assert!(script.contains("title: \"当前为手动模式\","));
     assert!(script.contains("state: \"manual\","));
@@ -1345,19 +1303,14 @@ fn stepwise_generation_mode_is_shared_through_backend_settings() {
 
     assert!(script.contains("bridgeCall(\"/settings/set\", {"));
     assert!(script.contains("codexAppStepwiseGenerationMode: nextMode"));
-    assert!(
-        script
-            .contains("Object.prototype.hasOwnProperty.call(normalizedPatch, \"generationMode\")")
-    );
+    assert!(script
+        .contains("Object.prototype.hasOwnProperty.call(normalizedPatch, \"generationMode\")"));
     assert!(script.contains("settingsSyncEpoch += 1;"));
     assert!(
         script.contains("pendingSettingsPatch = { ...pendingSettingsPatch, ...normalizedPatch };")
     );
-    assert!(
-        script.contains(
-            "if (!Object.prototype.hasOwnProperty.call(nextSettings, \"generationMode\"))"
-        )
-    );
+    assert!(script
+        .contains("if (!Object.prototype.hasOwnProperty.call(nextSettings, \"generationMode\"))"));
     assert!(script.contains("nextSettings.generationMode = stepwiseGenerationMode();"));
 }
 
@@ -1387,11 +1340,8 @@ fn stepwise_releases_only_the_stale_request_that_still_owns_pending_state() {
     assert!(script.contains("state.bridgePendingRequestId = 0;"));
     assert!(script.contains("if (state.bridgeStatus === \"pending\") {"));
     assert!(script.contains("state.bridgeStatus = \"idle\";"));
-    assert!(
-        !script.contains(
-            "if (!requestCurrent()) return;\n        if (state.bridgePendingHash === key)"
-        )
-    );
+    assert!(!script
+        .contains("if (!requestCurrent()) return;\n        if (state.bridgePendingHash === key)"));
 }
 
 #[test]
@@ -1399,9 +1349,7 @@ fn stepwise_rejects_generation_results_after_the_answer_identity_changes() {
     let script = assets::stepwise_script();
 
     assert!(script.contains("bridgeActiveKey: \"\","));
-    assert!(
-        script.contains("const requestAssistantMessageId = requestContext.assistantMessageId;")
-    );
+    assert!(script.contains("const requestAssistantMessageId = requestContext.assistantMessageId;"));
     assert!(script.contains("&& contextMatches(requestContext)"));
     assert!(
         script.contains("&& state.activeContext.assistantMessageId === requestAssistantMessageId")
@@ -1457,11 +1405,8 @@ fn stepwise_records_only_real_bridge_generation_requests() {
     assert_eq!(script.matches("bridge:generate-request").count(), 1);
     assert!(script.contains("function requestBridgeStepwise(key, userText, assistantText, requestMode = stepwiseGenerationMode(), options = {})"));
     assert!(script.contains("if (!stepwiseEnabled() || !key || state.bridgePendingHash === key || state.bridgeCache.has(key)) return;"));
-    assert!(
-        script.contains(
-            "if (normalizedMode === \"manual\" && options.userInitiated !== true) return;"
-        )
-    );
+    assert!(script
+        .contains("if (normalizedMode === \"manual\" && options.userInitiated !== true) return;"));
     assert!(script.contains("pushDiagnostic(\"bridge:generate-request\""));
 }
 
@@ -1470,7 +1415,7 @@ fn stepwise_opens_manager_as_transient_window() {
     let script = assets::stepwise_script();
 
     assert!(script.contains("bridgeCall(\"/manager/open-transient\", {"));
-    assert!(script.contains("page: \"settings\""));
+    assert!(script.contains("page: \"enhance\""));
     assert!(script.contains("section: \"stepwise\""));
 }
 
@@ -2171,11 +2116,8 @@ fn stepwise_keeps_context_stable_during_passive_scrolling() {
     assert!(script.contains("latestTurnAnchor: null,"));
     assert!(script.contains("function latestConversationTurnByKey(turns)"));
     assert!(script.contains("function nextLatestTurnAnchor(previous, turns, sessionId)"));
-    assert!(
-        script.contains(
-            "const sameSession = Boolean(sessionId) && previous?.sessionId === sessionId;"
-        )
-    );
+    assert!(script
+        .contains("const sameSession = Boolean(sessionId) && previous?.sessionId === sessionId;"));
     assert!(script.contains(
         "if (sameSession && compareConversationTurnKeys(mounted.turnKey, previous.turnKey) < 0) return previous;"
     ));
@@ -2373,10 +2315,8 @@ fn injection_script_defers_backend_mapped_toggles_until_settings_load() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("const codexPlusBackendMappedSettings = new Set"));
-    assert!(
-        script
-            .contains("codexPlusBackendMappedSettings.has(key) && !codexPlusBackendSettingsLoaded")
-    );
+    assert!(script
+        .contains("codexPlusBackendMappedSettings.has(key) && !codexPlusBackendSettingsLoaded"));
     assert!(script.contains("button.dataset.pending = String(waitsForBackend)"));
     assert!(script.contains(
         "button.disabled = waitsForBackend || button.dataset.relayUnneeded === \"true\""
@@ -2396,13 +2336,16 @@ fn injection_script_ignores_stale_backend_settings_responses() {
 }
 
 #[test]
-fn injection_script_skips_plugin_patch_work_in_relay_mode() {
+fn injection_script_controls_plugin_patch_with_enhancement_settings() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("function pluginPatchDisabledInRelayMode()"));
-    assert!(script.contains("!codexPlusBackendSettingsLoaded"));
-    assert!(script.contains("if (pluginPatchDisabledInRelayMode()) return"));
-    assert!(script.contains("clearPluginPatchArtifacts()"));
+    assert!(script.contains("function codexPluginMarketplacePatchEnabled()"));
+    assert!(script.contains(
+        "return codexPlusBackendSettingsLoaded && !!codexPlusSettings().pluginMarketplaceUnlock"
+    ));
+    assert!(script.contains("if (!codexPluginMarketplacePatchEnabled()) return"));
+    assert!(!script.contains("pluginPatchDisabledInRelayMode"));
+    assert!(!script.contains("codexMenuLocalizationScopeSelector()"));
 }
 
 #[test]
@@ -2457,27 +2400,9 @@ fn injection_script_keeps_plugin_marketplace_unlock_separate_from_entry_unlock()
 
     assert!(script.contains("pluginMarketplaceUnlock: true"));
     assert!(script.contains("pluginMarketplaceUnlock: \"codexAppPluginMarketplaceUnlock\""));
-    assert!(script.contains("if (!codexPlusSettings().pluginMarketplaceUnlock) return"));
+    assert!(script.contains("if (!codexPluginMarketplacePatchEnabled()) return"));
     assert!(script.contains("installPluginBuildFlavorFilterPatch"));
     assert!(script.contains("installPluginMarketplaceRequestPatch"));
-}
-
-#[test]
-fn injection_script_localizes_codex_menu_commands() {
-    let script = assets::injection_script(57321);
-
-    assert!(script.contains("const codexMenuLocalizationMap = new Map"));
-    assert!(script.contains("[\"Toggle Sidebar\", \"切换侧边栏\"]"));
-    assert!(script.contains("[\"Toggle Bottom Panel\", \"切换底部面板\"]"));
-    assert!(script.contains("[\"Toggle Pinned Summary\", \"切换置顶摘要\"]"));
-    assert!(script.contains("[\"Open Terminal\", \"打开终端\"]"));
-    assert!(script.contains("[\"Open Browser Tab\", \"打开浏览器标签页\"]"));
-    assert!(script.contains("[\"Focus Browser Address Bar\", \"聚焦浏览器地址栏\"]"));
-    assert!(script.contains("[\"Reload Browser Page\", \"重新加载浏览器页面\"]"));
-    assert!(script.contains("[\"Toggle Side Panel\", \"切换侧边面板\"]"));
-    assert!(script.contains("[\"Actual Size\", \"实际大小\"]"));
-    assert!(script.contains("function localizeCodexMenus"));
-    assert!(script.contains("localizeCodexMenus();"));
 }
 
 #[test]
@@ -2497,7 +2422,7 @@ fn injection_script_does_not_unlock_disabled_plugin_install_buttons() {
 fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"16\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"17\""));
     assert!(!script.contains("function pluginMarketplaceAliasForName"));
     assert!(
         !script.contains("if (name === \"openai-bundled\") return \"codex-plus-openai-bundled\"")
@@ -2509,7 +2434,7 @@ fn injection_script_keeps_bundled_marketplace_name_for_default_filter() {
 fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"16\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"17\""));
     assert!(script.contains("codexPluginFilterSourceCache = new WeakMap()"));
     assert!(script.contains("function codexPluginFilterCallbackSource(callback)"));
     assert!(script.contains("isCodexPluginBuildFlavorFilter"));
@@ -2527,7 +2452,7 @@ fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
 fn injection_script_expands_api_key_plugin_marketplace_requests() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"16\""));
+    assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"17\""));
     assert!(script.contains("installPluginMarketplaceRequestPatch"));
     assert!(script.contains("installPluginMarketplaceBridgePatch"));
     assert!(script.contains("installPluginBuildFlavorFilterPatch"));
@@ -2554,12 +2479,11 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     assert!(script.contains("codexPluginBroadCatalogKindsFromVersion = \"26.803.0\""));
     assert!(script.contains("broadCatalogPreserved: true"));
     assert!(script.contains("patchPluginMarketplaceResult"));
-    assert!(script.contains("__CODEX_PLUS_PLUGIN_MARKETPLACES__"));
-    assert!(script.contains("mergeLocalPluginMarketplaces(result)"));
-    assert!(script.contains("plugin_marketplace_local_merged"));
+    assert!(!script.contains("__CODEX_PLUS_PLUGIN_MARKETPLACES__"));
+    assert!(!script.contains("mergeLocalPluginMarketplaces"));
+    assert!(!script.contains("plugin_marketplace_local_merged"));
     assert!(script.contains("plugin_marketplace_remote_auth_fallback"));
-    assert!(script.contains("cloned.marketplaceName = marketplaceName"));
-    assert!(script.contains("cloned.marketplacePath = marketplaceName"));
+    assert!(!script.contains("normalizeLocalPluginMarketplacePlugin"));
     assert!(script.contains("restorePluginMarketplaceName"));
     assert!(script.contains(
         "next.remoteMarketplaceName = restorePluginMarketplaceName(next.remoteMarketplaceName)"
@@ -2571,8 +2495,7 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     );
     assert!(script.contains("restored === \"openai-api-curated\""));
     assert!(script.contains("restored === \"openai-curated-remote\""));
-    // 内置包的注册名已从 openai-curated-remote 换成 codex-plus-curated（前者是
-    // codex 保留名会被静默忽略），显示名映射同时认新旧两个名字。
+    // 既有原生配置的显示名兼容同时认新旧名称，不再注入或注册本地插件包。
     assert!(script.contains(
         "if (name === \"codex-plus-curated\" || name === \"openai-curated-remote\") return \"OpenAI插件5(Codex++)\""
     ));
@@ -2650,11 +2573,8 @@ fn injection_script_recovers_plugin_search_from_remote_auth_errors() {
         json!(["local", "vertical"])
     );
     assert_eq!(cases["generalAfterFallbackCwds"], json!(["C:/workspace"]));
-    assert_eq!(
-        cases["localFallbackMarketplaceNames"],
-        json!(["fixture-local"])
-    );
-    assert_eq!(cases["localFallbackPluginNames"], json!(["alpha"]));
+    assert_eq!(cases["localFallbackMarketplaceNames"], json!([]));
+    assert_eq!(cases["localFallbackPluginNames"], json!([]));
     assert_eq!(cases["chatGptKinds"], json!(["created-by-me-remote"]));
     assert_eq!(cases["unrelatedErrorMatched"], false);
 }
@@ -2673,7 +2593,7 @@ const scriptPath = {script_path};
 const store = new Map();
 function node() {{
   return {{
-    appendChild() {{}}, prepend() {{}}, remove() {{}}, setAttribute() {{}}, removeAttribute() {{}},
+    appendChild() {{}}, prepend() {{}}, remove() {{}}, setAttribute() {{}}, removeAttribute() {{}}, toggleAttribute() {{}},
     addEventListener() {{}}, querySelector() {{ return null; }}, querySelectorAll() {{ return []; }},
     closest() {{ return null; }},
     classList: {{ add() {{}}, remove() {{}}, toggle() {{}}, contains() {{ return false; }} }},
@@ -2701,6 +2621,7 @@ globalThis.navigator = {{ userAgent: "node-test", sendBeacon: () => false }};
 globalThis.performance = {{ getEntriesByType: () => [] }};
 globalThis.fetch = async () => ({{ ok: true, json: async () => ({{}}) }});
 require(scriptPath);
+// 旧页面留下的快照不应在新版列表或 API auth fallback 中恢复自动补齐。
 window.__CODEX_PLUS_PLUGIN_MARKETPLACES__ = [{{
   name: "fixture-local",
   displayName: "Fixture Local",
@@ -2839,13 +2760,33 @@ fn injection_script_loads_backend_settings_before_initial_scan() {
 }
 
 #[test]
+fn conversation_view_scope_regressions() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap();
+    let output = Command::new("node")
+        .arg(repo.join("assets/inject/conversation-view.test.cjs"))
+        .output()
+        .expect("node should run the conversation view regression harness");
+    assert!(
+        output.status.success(),
+        "conversation view harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn injection_script_exposes_conversation_view_width_control() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("conversationView: false"));
     assert!(script.contains("conversationView"));
     assert!(script.contains("conversationViewMaxWidth"));
-    assert!(script.contains("对话居中宽度"));
+    let item = assert_codex_setting_row(&script, "codexAppConversationView", "conversationView");
+    assert_eq!(item["title"], "对话居中宽度");
+    assert_eq!(item["codexInputs"][0]["id"], "conversationViewMaxWidth");
     assert!(script.contains("data-codex-plus-conversation-view-width"));
     assert!(script.contains("conversationViewWidth()"));
     assert!(script.contains("normalizeConversationViewWidth"));
@@ -2882,9 +2823,8 @@ fn injection_script_exposes_sidebar_thread_id_badge_control() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("threadIdBadge: false"));
-    assert!(script.contains("threadIdBadge: \"codexAppThreadIdBadge\""));
-    assert!(script.contains("会话 ID 标识"));
-    assert!(script.contains("data-codex-plus-setting=\"threadIdBadge\""));
+    let item = assert_codex_setting_row(&script, "codexAppThreadIdBadge", "threadIdBadge");
+    assert_eq!(item["title"], "会话 ID 标识");
     assert!(script.contains("codex-thread-id-badge"));
     assert!(script.contains("data-codex-thread-id-badge-wrap=\"true\""));
     assert!(script.contains("let threadIdBadgeActive = false"));
@@ -2895,14 +2835,118 @@ fn injection_script_exposes_sidebar_thread_id_badge_control() {
 }
 
 #[test]
+fn injection_script_exposes_capacity_auto_retry_control() {
+    let script = assets::injection_script(57321);
+
+    // 开关接线：默认值 → 后端映射 → 中文标签 → 菜单 DOM → 设置面板输入框。
+    assert!(script.contains("capacityAutoRetry: false"));
+    let item = assert_codex_setting_row(&script, "codexAppCapacityAutoRetry", "capacityAutoRetry");
+    assert_eq!(item["title"], "容量错误自动重试");
+    let inputs: Vec<&str> = item["codexInputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|input| input["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        inputs,
+        ["capacityAutoRetryIntervalSeconds", "capacityAutoRetryMaxAttempts"]
+    );
+    assert!(script.contains(r#"attribute: "data-codex-plus-capacity-retry-max-attempts""#));
+    assert!(script.contains(r#"attribute: "data-codex-plus-capacity-retry-interval""#));
+
+    // 运行逻辑：横幅识别只看语义结构（aside + 重试按钮），不绑 Codex 的 hash 类名。
+    assert!(script.contains("function findCapacityAutoRetryBanner"));
+    assert!(script.contains("function capacityAutoRetryTick"));
+    assert!(script.contains("function syncCodexPlusCapacityAutoRetry"));
+    assert!(script.contains("querySelectorAll(\"aside\")"));
+    assert!(script.contains("capacityAutoRetryLabelPattern"));
+    // 原生倒计时在跑时让路，避免和 Codex 自己的自动重试撞车。
+    assert!(script.contains("capacityAutoRetryCountdownPattern"));
+    assert!(script.contains("capacityAutoRetryNativeCountdownRunning"));
+    // 0 秒间隔必须合法（用户要求"失败就立刻重试"），但有 1 秒地板值防热循环。
+    assert!(script.contains("capacityAutoRetryMinIntervalMs = 1000"));
+    assert!(script.contains("capacityAutoRetryDefaultIntervalSeconds = 0"));
+    // 插进 DOM 的浮标必须带归属标记，否则会触发自喂扫描循环（issue #1960）。
+    assert!(script.contains("data-codex-plus-ext\", \"capacity-auto-retry\""));
+    assert!(script.contains("syncCodexPlusCapacityAutoRetry);"));
+}
+
+#[test]
+fn injection_script_uses_an_icon_for_idle_dictation() {
+    let script = assets::injection_script(57321);
+
+    // 空闲态是图标按钮：文字按钮在 composer 底栏比原生图标宽一倍多。
+    assert!(script.contains("function codexPlusDictationMicButton"));
+    assert!(script.contains("function codexPlusDictationMicIcon"));
+    assert!(script.contains("codexPlusDictationMicButton(state.phase !== \"idle\")"));
+    // 不再有「空闲态渲染文字按钮」这条路径。
+    assert!(!script.contains("codexPlusDictationControl(\"start\", \"语音输入\""));
+    // 无障碍名称不能丢：图标按钮只能靠 aria-label / title 表达用途。
+    assert!(script.contains("button.setAttribute(\"aria-label\", \"语音输入\")"));
+    assert!(script.contains("button.setAttribute(\"title\", \"语音输入\")"));
+    // 录音/转写这些状态仍然带文字，图标说不清。
+    assert!(script.contains("codexPlusDictationControl(\"insert\", \"停止并插入\")"));
+}
+
+#[test]
+fn injection_script_exposes_the_usage_status_line() {
+    let script = assets::injection_script(57321);
+
+    // 开关接线：默认值 → 后端映射。
+    assert!(script.contains("usageStatusLine: true"));
+    assert!(script.contains("usageStatusLine: \"codexAppUsageStatusLine\""));
+    assert!(script.contains("usageStatusLine: false"));
+
+    // 数据源走尾部快照路由，不能退回按秒整读历史的 /thread-usage-history。
+    assert!(script.contains("postJson(\"/thread-usage-live\""));
+    assert!(script.contains("data-above-composer-conversation-id"));
+    assert!(script.contains("data-composer-surface-variant"));
+    // 插进 DOM 的节点必须带归属标记，否则会触发自喂扫描循环（issue #1960）。
+    assert!(script.contains("data-codex-plus-ext\", \"builtin-usage-statusline\""));
+    assert!(script.contains("registerCodexPlusExtensionSelector"));
+    // 设置面板里的开关要能立刻生效，不用等下一拍轮询。
+    assert!(script.contains("__CODEX_PLUS_USAGE_STATUSLINE_SYNC__"));
+}
+
+#[test]
+fn injection_script_recovers_a_stalled_codex_boot_shell() {
+    let script = assets::injection_script(57321);
+
+    // 空壳判定依据：有 #root、长不出 <main>、且里头一个字都没有。
+    assert!(script.contains("function bootShellRecoveryStuck"));
+    assert!(script.contains("function bootShellRecoverySettled"));
+    assert!(script.contains("document.querySelector(\"main\")"));
+    assert!(script.contains("root.innerText.trim() === \"\""));
+
+    // 只刷主页面：活动悬浮层 / quick-chat 带 initialRoute，本来就没有 <main>。
+    assert!(script.contains("function bootShellRecoveryAppliesHere"));
+    assert!(script.contains("/[?&]initialRoute=/"));
+    // 宽限要足够长，才能把「启动慢」和「真卡死」分开。
+    assert!(script.contains("bootShellRecoveryGraceMs = 20000"));
+    // 限次靠 sessionStorage + 冷却：写不进去就宁可不刷，避免刷新循环。
+    assert!(script.contains("bootShellRecoveryCooldownMs = 60000"));
+    assert!(script.contains("window.sessionStorage.getItem(bootShellRecoveryStorageKey)"));
+    assert!(script.contains("window.sessionStorage.setItem(bootShellRecoveryStorageKey"));
+    // 触发过要能从 codex-plus.log 复盘。
+    assert!(script.contains("boot_shell_recovery_reload"));
+    assert!(script.contains("window.location.reload();"));
+    // 模块末尾必须真的装上，否则整段是死代码。
+    assert!(script.contains("installBootShellRecovery();"));
+}
+
+#[test]
 fn injection_script_keeps_session_action_buttons_in_pr_style() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("actionButtonClass = \"codex-session-action-button\""));
+    // 优先套用同一行原生置顶 / 归档按钮的类名与 data-* 属性；兜底样式只在没套上时生效，
+    // 悬停只提亮文字色、不铺底色，也不再从原生静止态抄颜色变量。
+    assert!(script.contains("function syncNativeSessionActionStyle(row)"));
+    assert!(script.contains(".${actionButtonClass}:not([data-codex-native-style]) {"));
     assert!(script.contains("background: transparent;"));
-    assert!(
-        script.contains("background: var(--codex-session-action-hover-background, transparent);")
-    );
+    assert!(script.contains("var(--color-text-secondary-ghost-hover,"));
+    assert!(!script.contains("--codex-session-action-hover-background"));
     assert!(script.contains("cursor: default;"));
 }
 
@@ -2948,8 +2992,8 @@ fn injection_script_refreshes_sidebar_after_session_undo() {
         .split_once("function showToast(message, options = {})")
         .expect("undo toast should exist")
         .1
-        .split_once("function upstreamWorktreeField")
-        .expect("undo toast should end before worktree helpers")
+        .split_once("function shareBase64Url")
+        .expect("undo toast should end before sharing helpers")
         .0;
 
     assert!(refresh.contains("loadOptionalCodexAppModule(\"app-server-manager-signals-\")"));
@@ -3006,7 +3050,7 @@ fn run_session_ref_contract_harness() -> serde_json::Value {
 const scriptPath = {script_path};
 function node() {{
   return {{
-    appendChild() {{}}, prepend() {{}}, remove() {{}}, setAttribute() {{}}, removeAttribute() {{}},
+    appendChild() {{}}, prepend() {{}}, remove() {{}}, setAttribute() {{}}, removeAttribute() {{}}, toggleAttribute() {{}},
     addEventListener() {{}}, querySelector() {{ return null; }}, querySelectorAll() {{ return []; }},
     closest() {{ return null; }}, getAttribute() {{ return null; }},
     classList: {{ add() {{}}, remove() {{}}, toggle() {{}}, contains() {{ return false; }} }},
@@ -3091,12 +3135,164 @@ process.exit(0);
 }
 
 #[test]
+fn session_ref_shard_keeps_host_scope_and_does_not_guess_local_from_uuid() {
+    let shard =
+        std::fs::read_to_string("../../assets/inject/renderer-inject/60-plugin-marketplace.js")
+            .unwrap();
+    let start = shard.find("  function isClientNewThreadId(value)").unwrap();
+    let end = shard
+        .find("  if (window.__CODEX_PLUS_TEST_SESSION_REF__)")
+        .unwrap();
+    let helpers = &shard[start..end];
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("session-host.cjs");
+    std::fs::write(&path, format!(r#"
+const selectors = {{ threadTitle: ".title" }};
+{helpers}
+const id = "11111111-1111-4111-8111-111111111111";
+function row(scopedId, props, hostId) {{
+  const r = {{ getAttribute: k => k === "data-app-action-sidebar-thread-id" ? scopedId : k === "data-app-action-sidebar-thread-host-id" ? hostId : null, querySelector: () => null, textContent: "fixture" }};
+  if (props) r.__reactFiber$fixture = {{ pendingProps: props, memoizedProps: null, return: null }};
+  return r;
+}}
+const cases = {{
+  local: sessionRefFromRow(row(id, {{conversationId:id, hostId:"local"}})),
+  scopedLocal: sessionRefFromRow(row("local:"+id)),
+  remote: sessionRefFromRow(row(id, {{conversationId:id, hostId:"remote-ssh:fixture"}})),
+  scopedRemote: sessionRefFromRow(row("remote-ssh:fixture:"+id)),
+  unknown: sessionRefFromRow(row(id)),
+  conflict: sessionRefFromRow(row("local:"+id, {{conversationId:id, hostId:"remote-ssh:fixture"}})),
+  unrelated: sessionRefFromRow(row(id, {{conversationId:"22222222-2222-4222-8222-222222222222", hostId:"local"}})),
+  wrapped: sessionRefFromRow(row(id, {{children:{{props:{{conversationId:id,hostId:"local"}}}}}})),
+  nativeAttribute: sessionRefFromRow(row(id, null, "local")),
+}};
+process.stdout.write(JSON.stringify(cases));
+"#)).unwrap();
+    let output = Command::new("node").arg(&path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cases: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for name in ["local", "scopedLocal", "wrapped", "nativeAttribute"] {
+        assert_eq!(cases[name]["host_id"], "local");
+    }
+    for name in ["remote", "scopedRemote"] {
+        assert_eq!(cases[name]["host_id"], "remote-ssh:fixture");
+        assert_eq!(
+            cases[name]["session_id"],
+            "11111111-1111-4111-8111-111111111111"
+        );
+    }
+    for name in ["unknown", "conflict", "unrelated"] {
+        assert!(cases[name]["host_id"].is_null());
+    }
+}
+
+#[test]
+fn remote_delete_uses_only_the_matching_native_host_without_local_fallback() {
+    let shard = std::fs::read_to_string("../../assets/inject/renderer-inject/60-plugin-marketplace.js").unwrap();
+    let helpers = &shard[shard.find("  function isClientNewThreadId(value)").unwrap()..shard.find("  if (window.__CODEX_PLUS_TEST_SESSION_REF__)").unwrap()];
+    let native = &shard[shard.find("  const codexNativeHostClients =").unwrap()..shard.find("  function threadIdBadgeTitleNode(row)").unwrap()];
+    let post = &shard[shard.find("  async function postJson(path, payload)").unwrap()..shard.find("  function downloadMarkdownFallback(").unwrap()];
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("native-delete.cjs");
+    std::fs::write(&path, format!(r#"
+globalThis.window = globalThis;
+window.__CODEX_PLUS_TEST_SESSION_REF__ = true;
+window.__codexPlusSessionRefTest = {{}};
+const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
+const selectors = {{threadTitle: ".title"}};
+let rows = [], moduleValue = {{}}, bridgeCalls = 0;
+const nativeCalls = [], selectedHosts = [], notifications = [];
+const id = "11111111-1111-4111-8111-111111111111";
+const localCache = new Set([id]), remoteCache = new Set([id]);
+function sessionRows() {{return rows;}}
+async function loadOptionalCodexAppModule() {{return moduleValue;}}
+function recordCodexPlusBridgeSuccess() {{}}
+function recordCodexPlusBridgeFailure() {{}}
+function sendCodexPlusDiagnostic() {{}}
+window.__codexSessionDeleteBridge = async () => {{bridgeCalls++;return {{status:"local_deleted",undo_token:"local-backup"}};}};
+{helpers}
+{native}
+{post}
+class NativeClient {{
+  constructor(hostId) {{this.hostId=hostId;}}
+  async sendRequest(method, params) {{
+    if (this.disposed) throw new Error("AppServerRequestClient is missing a message dispatcher");
+    nativeCalls.push({{hostId:this.hostId,method,threadId:params.threadId}});
+    if (this.fail) throw new Error("fixture transport failure");
+    notifications.push({{hostId:this.hostId,threadId:params.threadId}});
+    if (this.hostId==="remote-a") remoteCache.delete(params.threadId);
+    return {{}};
+  }}
+}}
+(async()=>{{
+  const local=new NativeClient("local"), remote=new NativeClient("remote-a");
+  if (!registerNativeHostClient(local)||!registerNativeHostClient(remote)) throw new Error("native fixture registration failed");
+  const ref={{session_id:id,title:"Fixture",host_id:"remote-a"}};
+  const success=await postJson("/delete",ref);
+  const isolated=bridgeCalls===0&&localCache.has(id)&&!remoteCache.has(id)&&nativeCalls.length===1&&nativeCalls[0].hostId==="remote-a";
+  const unknown=await postJson("/delete",{{session_id:id}});
+  const conflicting=await postJson("/delete",{{...ref,hostId:"local"}});
+  const unknownSafe=bridgeCalls===0&&nativeCalls.length===1;
+  remoteCache.add(id);remote.fail=true;
+  const failure=await postJson("/delete",ref);
+  const failureSafe=remoteCache.has(id)&&localCache.has(id)&&bridgeCalls===0&&notifications.length===1;
+  remote.fail=false;remote.hostId="remote-b";
+  const wrongHost=await postJson("/delete",ref);
+  const wrongSafe=nativeCalls.length===2&&bridgeCalls===0&&localCache.has(id);
+  codexNativeHostClients.clear();registerNativeHostClient(local);
+  const missing=await postJson("/delete",ref);
+  const missingSafe=nativeCalls.length===2&&bridgeCalls===0;
+  const localResult=await postJson("/delete",{{session_id:id,host_id:"local"}});
+  const localKept=bridgeCalls===1&&localResult.undo_token==="local-backup";
+
+  // 所有其它功能关闭且没有captured client：使用当前行 AppScope 的原生 forHost。
+  codexNativeHostClients.clear();
+  window.__codexPlusSettings={{sessionDelete:true,modelWhitelistUnlock:false,serviceTierControls:false}};
+  const appScope={{}}, atom={{}}, goodClient=new NativeClient("remote-a"), wrongClient=new NativeClient("local");
+  let wrong=false;
+  const rpc={{forHost(hostId){{selectedHosts.push(hostId);return wrong?wrongClient:goodClient;}}}};
+  function nativeGetter(scope, hostId) {{const manager=scope.get(atom);if(!manager)throw new Error("AppServerManager RPC is not connected");return manager.forHost(hostId);}}
+  moduleValue={{appScope,nativeGetter}};
+  const scope={{scope:appScope,get:key=>key===atom?rpc:null}};
+  const row={{getAttribute:key=>key==="data-app-action-sidebar-thread-id"?id:key==="data-app-action-sidebar-thread-host-id"?"remote-a":null,querySelector:()=>null,textContent:"Fixture",__reactFiber$fixture:{{pendingProps:{{conversationId:id,hostId:"remote-a"}},memoizedProps:null,return:null,memoizedState:{{memoizedState:{{current:scope}},next:null}}}}}};
+  rows=[row];remoteCache.add(id);
+  const freshSuccess=await postJson("/delete",ref);
+  const freshSafe=bridgeCalls===1&&selectedHosts[0]==="remote-a"&&localCache.has(id)&&!remoteCache.has(id);
+  codexNativeHostClients.clear();wrong=true;remoteCache.add(id);
+  const freshWrong=await postJson("/delete",ref);
+  const freshWrongSafe=bridgeCalls===1&&remoteCache.has(id)&&nativeCalls.length===3;
+  process.stdout.write(JSON.stringify({{success,isolated,unknown,conflicting,unknownSafe,failure,failureSafe,wrongHost,wrongSafe,missing,missingSafe,localKept,freshSuccess,freshSafe,freshWrong,freshWrongSafe}}));
+}})().catch(error=>{{console.error(error);process.exit(1);}});
+"#)).unwrap();
+    let output = Command::new("node").arg(&path).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let cases: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for name in ["isolated", "unknownSafe", "failureSafe", "wrongSafe", "missingSafe", "localKept", "freshSafe", "freshWrongSafe"] {
+        assert_eq!(cases[name], true, "{name}: {cases}");
+    }
+    for name in ["unknown", "conflicting", "failure", "wrongHost", "missing", "freshWrong"] {
+        assert_eq!(cases[name]["status"], "failed");
+    }
+    for name in ["success", "freshSuccess"] {
+        assert_eq!(cases[name]["status"], "server_deleted");
+        assert!(cases[name]["undo_token"].is_null());
+        assert!(cases[name]["backup_path"].is_null());
+    }
+}
+
+#[test]
 fn injection_script_moves_export_and_project_move_into_more_menu() {
     let script = assets::injection_script(57321).replace("\r\n", "\n");
 
     assert!(script.contains("moreButtonClass = \"codex-session-more-button\""));
     assert!(script.contains("moreMenuClass = \"codex-session-more-menu\""));
-    assert!(script.contains("configureActionButton(moreButton, \"更多操作\", \"…\")"));
+    assert!(
+        script.contains("configureSvgActionButton(moreButton, \"更多操作\", ellipsisIconSvg())")
+    );
     assert!(script.contains("createSessionMoreMenuItem(\"导出\""));
     assert!(!script.contains("createSessionMoreMenuItem(\"移动\""));
     assert!(script.contains("group.appendChild(moreButton)"));
@@ -3146,7 +3342,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"9\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"27\""));
 
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
@@ -3200,6 +3396,11 @@ const codexPlusModelMetadata = () => null;
 const modelReasoningEfforts = () => [];
 const applyCodexPlusModelMetadata = () => false;
 const codexPlusModelNames = () => ["supplier-default", "extra-model"];
+const codexRemoteSessionActiveProfile = () => ({{ id: "custom", relayMode: "official" }});
+const codexPlusModelUnlockEnabled = () => true;
+const codexPlusBackendSettingsLoaded = true;
+const codexPlusModelCollectionSnapshots = new WeakMap();
+const codexPlusModelDefaultSnapshots = new WeakMap();
 {function_source}
 
 const missingDefault = {{ value: {{ available_models: ["native-model"] }} }};
@@ -3251,115 +3452,31 @@ if (existingContainerDefault.model !== hostModel) process.exit(10);
 }
 
 #[test]
-fn injection_script_exposes_fast_service_tier_control() {
+fn injection_script_retires_legacy_fast_controls_and_preserves_native_unlock() {
     let script = assets::injection_script(57321);
-
-    assert!(script.contains("default-service-tier"));
-    assert!(script.contains("setting-storage-"));
-    assert!(script.contains("codexAppAssetUrl"));
-    assert!(script.contains("codexThreadServiceTierOverrides"));
-    assert!(script.contains("setCodexThreadServiceTierMode"));
-    assert!(script.contains("codexServiceTierRequestOverride"));
-    assert!(script.contains("codexServiceTierSupportedFastModels"));
-    assert!(script.contains("\"gpt-5.4\""));
-    assert!(script.contains("\"gpt-5.5\""));
-    assert!(script.contains("\"gpt-5.6-sol\""));
-    assert!(script.contains("\"gpt-5.6-terra\""));
-    assert!(script.contains("\"gpt-5.6-luna\""));
-    assert!(script.contains("codexServiceTierFastSupportedForModel"));
-    assert!(script.contains("codexServiceTierModelForRequest"));
-    assert!(script.contains("codexServiceTierMaybeLoadModelCatalog"));
-    assert!(script.contains("fastBlocked"));
-    assert!(script.contains("data-tier=\"unsupported\""));
-    assert!(script.contains("nextParams.service_tier = override.serviceTier"));
-    assert!(script.contains("serviceTierControls: false"));
-    assert!(script.contains("data-codex-plus-setting=\"serviceTierControls\""));
-    assert!(script.contains("data-codex-service-tier-controls"));
-    assert!(script.contains("removeCodexServiceTierBadges"));
-    assert!(script.contains("installCodexServiceTierDispatcherPatch"));
-    assert!(script.contains("codexServiceTierDispatcherPatchable"));
-    assert!(script.contains("dispatcher is a non-writable RPC stub"));
-    assert!(script.contains("Object.isExtensible(dispatcher)"));
-    assert!(script.contains("applyCodexServiceTierRequestOnly"));
-    assert!(script.contains("codexPlusServiceTierPrewarmThreadStart"));
-    assert!(script.contains("Object.isExtensible(client)"));
+    for retired in [
+        "data-codex-plus-setting=\"serviceTierControls\"",
+        "data-codex-service-tier-global-fast",
+        "toggleCodexServiceTierFromBadge",
+        "setCodexThreadServiceTierMode",
+        "applyCodexServiceTierRequestOnly",
+    ] {
+        assert!(!script.contains(retired), "retired legacy Fast behavior: {retired}");
+    }
+    assert_codex_setting_row(&script, "codexAppNativeFastUnlock", "nativeFastUnlock");
+    assert!(script.contains("__codexPlusNativeFastUnlock"));
+    assert!(script.contains("codexAppNativeFastUnlock"));
+    assert!(script.contains("serviceTiers"));
     assert!(script.contains("locateCodexAppServerClientBreakpoint"));
-    assert!(script.contains("installCodexAppServerClientCapture"));
-    assert!(script.contains("__codexPlusAppServerClientCapture"));
     assert!(script.contains("installCodexAppServerClientPrototypePatch"));
-    assert!(script.contains("__codexPlusAppServerClientClass"));
-    assert!(script.contains("app_server_client_prototype_patch_installed"));
-    assert!(script.contains("服务模式"));
-    assert!(script.contains("data-codex-service-tier-status"));
-    assert!(script.contains("data-codex-service-tier-inherit"));
-    assert!(script.contains("data-codex-service-tier-standard"));
-    assert!(script.contains("data-codex-service-tier-fast"));
-    assert!(script.contains("data-codex-service-tier-custom"));
-    assert!(script.contains("data-codex-service-tier-thread-inherit"));
-    assert!(script.contains("data-codex-service-tier-thread-standard"));
-    assert!(script.contains("data-codex-service-tier-thread-fast"));
-    assert!(script.contains("global-standard"));
-    assert!(script.contains("global-fast"));
-    assert!(script.contains("defaultMode"));
-    assert!(script.contains("codexServiceTierEffectiveThreadMode"));
-    assert!(script.contains("codexServiceTierDefaultModeForControlMode"));
-    assert!(script.contains("normalizeCodexServiceTierControlMode(state.mode) !== \"custom\""));
-    assert!(script.contains("state.draft = null"));
-    assert!(script.contains("后端未连接，无法切换服务模式"));
-    assert!(script.contains("未连接"));
-    assert!(script.contains("thread/start"));
-    assert!(script.contains("thread/resume"));
-    assert!(script.contains("turn/start"));
-    assert!(script.contains("send-cli-request-for-host"));
-    assert!(script.contains("start-conversation"));
-    assert!(script.contains("applyCodexServiceTierRequestOverride(\"thread/start\", message)"));
-    assert!(script.contains("codex-service-tier-badge"));
-    assert!(script.contains("installCodexServiceTierBadge"));
-    assert!(script.contains("toggleCodexServiceTierFromBadge"));
-    assert!(script.contains("wireCodexServiceTierBadge"));
-    assert!(script.contains("codexServiceTierBadgePlacement"));
-    assert!(script.contains("codexServiceTierBadgeFooterGroup"));
-    assert!(script.contains("codexServiceTierFindComposerEl"));
-    assert!(script.contains("codexServiceTierVisibleComposerFooters"));
-    assert!(script.contains("codexServiceTierBestComposerFooter"));
-    assert!(script.contains("codexServiceTierComposerCandidates"));
-    assert!(script.contains("codexServiceTierComposerScore"));
-    assert!(script.contains("data-codex-service-tier-badge"));
-    assert!(script.contains("codexServiceTierBadgeWired"));
-    assert!(script.contains("setAttribute(\"role\", \"button\")"));
-    assert!(script.contains("setAttribute(\"tabindex\", \"0\")"));
-    assert!(script.contains("继承 Codex 默认设置"));
-    assert!(script.contains("继承 config.toml"));
-    assert!(script.contains("serviceTierInheritSourceLabel"));
-    assert!(script.contains("resolveInheritedServiceTier"));
-    assert!(script.contains("getConfigTomlServiceTier"));
-    assert!(script.contains("catalog.service_tier"));
-    assert!(script.contains("service_tier=\\\"priority\\\""));
-    assert!(script.contains("Fast 仅支持"));
-    assert!(script.contains("当前 thread"));
-    assert!(script.contains("standard"));
-    assert!(script.contains("fast"));
-    assert!(script.contains("[\"setting-storage-\", \"app-initial-\"]"));
-    assert!(script.contains("[\"setting-storage-\", \"vscode-api-\", \"app-initial-\"]"));
-    assert!(script.contains("[\"vscode-api-\", \"app-initial-\"]"));
-    assert!(script.contains("codexSettingStorageFromModule"));
-    assert!(script.contains("codexStateApiFromModule"));
-    assert!(script.contains("message.type === \"fetch\""));
-    assert!(script.contains("vscode://codex/"));
-    assert!(script.contains("./(?:assets/)?"));
-    assert!(script.contains("dispatcher export unavailable"));
-    assert!(!script.contains("data-codex-max-reasoning-control"));
-    assert!(!script.contains("codexAppMaxReasoningOverride"));
 }
 
 #[test]
 fn injection_script_keeps_remote_provider_patch_installed_for_openai_identity() {
     let script = assets::injection_script(57321);
 
-    assert!(
-        script
-            .contains("codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled()")
-    );
+    assert!(script
+        .contains("codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled()"));
     assert!(script.contains("if (!codexRemoteSessionProviderPatchEnabled()) return;"));
 }
 
@@ -3418,66 +3535,17 @@ fn injection_script_refreshes_sidebar_after_undo_without_stale_asset_exports() {
 }
 
 #[test]
-fn injection_script_applies_fast_service_tier_contract() {
-    let cases = run_service_tier_contract_harness();
+fn injection_script_preserves_native_tiers_and_shared_provider_contracts() {
+    let cases = run_native_tier_and_provider_contract_harness();
 
-    assert_eq!(cases["supportedFast"]["serviceTier"], "priority");
-    assert_eq!(cases["supportedFast"]["service_tier"], "priority");
-
-    assert_eq!(
-        cases["unsupportedModel"]["serviceTier"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["unsupportedModel"]["service_tier"],
-        serde_json::Value::Null
-    );
-
-    assert_eq!(cases["turnWithoutModel"]["serviceTier"], "priority");
-    assert_eq!(cases["turnWithoutModelDiagnosticModel"], "gpt-5.4");
-
-    assert_eq!(
-        cases["customInheritUnsupported"]["serviceTier"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["customInheritUnsupported"]["service_tier"],
-        serde_json::Value::Null
-    );
-
-    assert_eq!(cases["inheritUnsetStatus"], "继承 Codex 默认设置：默认");
-    assert_eq!(cases["inheritFastStatus"], "继承 Codex 默认设置：fast");
-    assert_eq!(
-        cases["inheritStandardStatus"],
-        "继承 Codex 默认设置：standard"
-    );
-    assert_eq!(
-        cases["inheritConfigTomlFastStatus"],
-        "继承 config.toml：fast"
-    );
-    assert_eq!(cases["resolvedConfigTomlTier"]["configServiceTier"], "fast");
-    assert_eq!(
-        cases["resolvedConfigTomlTier"]["serviceTierSource"],
-        "config-toml"
-    );
-    assert_eq!(
-        cases["resolvedUnsetTier"]["configServiceTier"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["resolvedUnsetTier"]["serviceTierSource"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["inheritedConfigFastBlocked"]["serviceTier"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        cases["inheritedConfigFastBlocked"]["service_tier"],
-        serde_json::Value::Null
-    );
-
-    assert_eq!(cases["startConversation"]["serviceTier"], "priority");
+    // 旧浏览器开关和线程模式残留不能再注入或剥离原生 service tier。
+    assert_eq!(cases["withoutNativeTier"]["serviceTier"], serde_json::Value::Null);
+    assert_eq!(cases["withoutNativeTier"]["service_tier"], serde_json::Value::Null);
+    assert_eq!(cases["customModelNativeTier"]["serviceTier"], serde_json::Value::Null);
+    assert_eq!(cases["customModelNativeTier"]["service_tier"], "priority");
+    assert_eq!(cases["threadOnlyRequest"]["serviceTier"], serde_json::Value::Null);
+    assert_eq!(cases["customModelNativeSnakeTier"]["service_tier"], "priority");
+    assert_eq!(cases["startConversation"]["serviceTier"], serde_json::Value::Null);
     assert_eq!(
         cases["explicitProjectStartConversation"]["workspaceKind"],
         "project"
@@ -3494,19 +3562,17 @@ fn injection_script_applies_fast_service_tier_contract() {
         cases["projectlessStartConversation"]["projectlessOutputDirectory"],
         "C:/projectless/outputs"
     );
-    assert!(
-        cases["projectlessStartConversation"]
-            .get("projectAssignment")
-            .is_none()
-    );
-    assert_eq!(cases["fetchStartConversation"]["serviceTier"], "priority");
+    assert!(cases["projectlessStartConversation"]
+        .get("projectAssignment")
+        .is_none());
+    assert_eq!(cases["fetchStartConversation"]["serviceTier"], serde_json::Value::Null);
     assert_eq!(
         cases["fetchSendCliRequest"]["params"]["serviceTier"],
-        "priority"
+        serde_json::Value::Null
     );
     assert_eq!(
         cases["fetchSendCliRequest"]["params"]["service_tier"],
-        "priority"
+        serde_json::Value::Null
     );
     assert_eq!(cases["solFastAvailability"]["supported"], true);
     assert_eq!(cases["solDescriptor"]["defaultReasoningEffort"], "low");
@@ -3532,6 +3598,7 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["serviceTierClientPatched"], true);
     assert_eq!(cases["serviceTierClientSendTier"], "priority");
     assert_eq!(cases["serviceTierClientPrewarmTier"], "priority");
+    assert_eq!(cases["retiredClientPatchReplaced"], true);
     assert_eq!(cases["frozenClientPatchSkipped"], true);
     assert_eq!(cases["captureLine"], 1);
     assert_eq!(cases["captureColumn"], 24);
@@ -3548,7 +3615,7 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["providerFromOtherUnchanged"], true);
     assert_eq!(cases["nonThreadProviderUnchanged"], true);
     assert_eq!(
-        cases["providerWithServiceTierControlsDisabled"]["modelProvider"],
+        cases["providerWithLegacyControlsIgnored"]["modelProvider"],
         "vendor_alpha"
     );
     assert_eq!(cases["appServerProviderOverride"], "vendor_alpha");
@@ -3588,14 +3655,16 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["openAiNormalizationDisabled"], true);
     assert_eq!(cases["refreshedCustomProviderOverride"], "refreshed_vendor");
     assert_eq!(cases["refreshedOpenAiProvider"], "openai");
-    assert_eq!(cases["refreshedPureApiResumeProvider"], "openai");
+    assert_eq!(cases["refreshedPureApiResumeProvider"], "custom");
     assert_eq!(cases["refreshedPureApiResumeModel"], "gpt-5.6-terra");
     assert_eq!(cases["failedRefreshProviderUnchanged"], "openai");
     assert_eq!(cases["missingActiveProviderUnchanged"], true);
     assert_eq!(cases["missingActiveRecoveryUnscheduled"], true);
     assert_eq!(cases["pureApiThreadStartProvider"], "custom");
-    assert_eq!(cases["pureApiThreadResumeUnchanged"], true);
-    assert_eq!(cases["pureApiNativeResumeUnchanged"], true);
+    assert_eq!(cases["pureApiThreadResumeProvider"], "custom");
+    assert_eq!(cases["pureApiNativeResumeProvider"], "custom");
+    assert_eq!(cases["pureApiExplicitResumePreserved"], true);
+    assert_eq!(cases["officialResumePreserved"], true);
     assert_eq!(cases["pureApiTurnStartProvider"], "custom");
     assert_eq!(cases["pureApiTurnWithoutProviderUnchanged"], true);
     assert_eq!(cases["pureApiOtherProviderUnchanged"], true);
@@ -3611,12 +3680,49 @@ fn injection_script_applies_fast_service_tier_contract() {
             "turn/start:"
         ])
     );
-    assert_eq!(cases["modelSwitchResumeProvider"], "");
+    assert_eq!(cases["modelSwitchResumeProvider"], "sub2api");
     assert_eq!(cases["failedModelSwitchResumeAttempts"], 2);
     assert_eq!(cases["failedModelSwitchTurnAttempts"], 2);
+    assert_eq!(cases["delayedResumeWaited"], true);
+    assert_eq!(cases["hungSettingsForwarded"], json!(["instance", "prototype"]));
+    assert_eq!(cases["lateSettingsIgnored"], json!(["stale_vendor", "stale_vendor"]));
+    assert_eq!(cases["turnCompletedBeforeCatalogRead"], true);
+    assert_eq!(cases["hungCatalogListReturned"], true);
+    assert_eq!(cases["lateCatalogIgnored"], "failed");
+    assert_eq!(
+        cases["pureApiFilteredModels"],
+        json!(["gpt-5.6-sol", "relay-model"])
+    );
+    assert_eq!(
+        cases["pureApiFilteredNames"],
+        json!(["gpt-5.6-sol", "relay-model"])
+    );
+    assert_eq!(
+        cases["pureApiFilteredSet"],
+        json!(["gpt-5.6-sol", "relay-model"])
+    );
+    assert_eq!(
+        cases["pureApiStatsigFiltered"],
+        json!(["gpt-5.6-sol", "relay-model"])
+    );
+    assert_eq!(
+        cases["unfilteredModelScenarios"],
+        json!([true, true, true, true, true])
+    );
+    assert_eq!(cases["pureApiDefaultModel"], "relay-model");
+    assert_eq!(cases["pureApiStatsigDefault"], "relay-model");
+    assert_eq!(cases["modelsRestoredAfterModeChange"], true);
+    assert_eq!(cases["modelsRestoredAfterReinjection"], true);
+    assert_eq!(cases["modelsRestoredAfterCatalogFailure"], true);
+    assert_eq!(cases["remoteModelsPreservedForSharedCache"], true);
+    assert_eq!(cases["remotePrototypeModelsPreserved"], true);
+    assert_eq!(cases["unknownHostModelsPreserved"], true);
+    assert_eq!(cases["remoteJsonAndMessageModelsPreserved"], true);
+    assert_eq!(cases["sessionDeleteOnlyRegistersNativeClient"], true);
+    assert_eq!(cases["globalStatsigWithoutHostPreserved"], true);
 }
 
-fn run_service_tier_contract_harness() -> serde_json::Value {
+fn run_native_tier_and_provider_contract_harness() -> serde_json::Value {
     let temp = tempfile::tempdir().expect("temp dir should be created");
     let script_path = temp.path().join("renderer-inject.js");
     let harness_path = temp.path().join("service-tier-harness.cjs");
@@ -3629,6 +3735,7 @@ fn run_service_tier_contract_harness() -> serde_json::Value {
 const scriptPath = {script_path};
 const store = new Map();
 store.set("codexPlusSettings", JSON.stringify({{ serviceTierControls: true }}));
+store.set("codexThreadServiceTierOverrides", JSON.stringify({{ version: "1", mode: "global-fast", defaultMode: "fast", entries: {{}} }}));
 function node() {{
   return {{
     appendChild() {{}},
@@ -3636,6 +3743,7 @@ function node() {{
     remove() {{}},
     setAttribute() {{}},
     removeAttribute() {{}},
+    toggleAttribute() {{}},
     addEventListener() {{}},
     querySelector() {{ return null; }},
     querySelectorAll() {{ return []; }},
@@ -3678,67 +3786,31 @@ globalThis.navigator = {{ userAgent: "node-test" }};
 globalThis.performance = {{ getEntriesByType: () => [] }};
 require(scriptPath);
 const api = window.__codexPlusServiceTierTest;
-api.setServiceTierState({{ status: "ok", serviceTier: "priority", fastTierValue: "priority" }});
 api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4", "gpt-5.5"] }});
-const inheritUnsetStatus = api.statusSummary({{
-  controlMode: "inherit",
-  threadMode: "inherit",
-  defaultMode: "inherit",
-  effectiveMode: "standard",
-  effectiveServiceTier: null,
-}});
-const inheritFastStatus = api.statusSummary({{
-  controlMode: "inherit",
-  threadMode: "inherit",
-  defaultMode: "inherit",
-  effectiveMode: "fast",
-  effectiveServiceTier: "priority",
-}});
-const inheritStandardStatus = api.statusSummary({{
-  controlMode: "inherit",
-  threadMode: "inherit",
-  defaultMode: "inherit",
-  effectiveMode: "standard",
-  effectiveServiceTier: "standard",
-}});
-const inheritConfigTomlFastStatus = api.statusSummary({{
-  controlMode: "inherit",
-  threadMode: "inherit",
-  defaultMode: "inherit",
-  effectiveMode: "fast",
-  effectiveServiceTier: "fast",
-  serviceTierSource: "config-toml",
-}});
-
-api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
-const supportedFast = api.applyServiceTierOverride("turn/start", {{
+const withoutNativeTier = api.applyServiceTierOverride("turn/start", {{
   threadId: "thread-12345678",
   model: "gpt-5.4",
   service_tier: null,
 }}, "conv-should-not-be-model");
 
-const unsupportedModel = api.applyServiceTierOverride("turn/start", {{
+const customModelNativeTier = api.applyServiceTierOverride("turn/start", {{
   threadId: "thread-12345678",
   model: "gpt-4.1",
   service_tier: "priority",
 }}, "conv-should-not-be-model");
 
-const turnWithoutModel = api.applyServiceTierOverride("turn/start", {{
+const threadOnlyRequest = api.applyServiceTierOverride("turn/start", {{
   threadId: "thread-12345678",
   service_tier: null,
 }}, "conversation-should-not-be-model");
-const turnWithoutModelDiagnosticModel = api.diagnostics().at(-1)?.detail?.model;
 
 api.setModelCatalog({{ status: "ok", model: "gpt-4.1", default_model: "gpt-4.1", models: ["gpt-4.1"] }});
-api.setThreadState({{ mode: "custom", defaultMode: "inherit", entries: {{}}, draft: {{ mode: "inherit", at: Date.now() }} }});
-api.setServiceTierState({{ serviceTier: "priority" }});
-const customInheritUnsupported = api.applyServiceTierOverride("turn/start", {{
+const customModelNativeSnakeTier = api.applyServiceTierOverride("turn/start", {{
   threadId: "thread-12345678",
   service_tier: "priority",
 }}, "");
 
 api.setModelCatalog({{ status: "ok", model: "gpt-5.5", default_model: "gpt-5.5", models: ["gpt-5.5"] }});
-api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
 const startConversation = api.requestOverride({{
   type: "start-conversation",
   threadId: "thread-12345678",
@@ -3904,7 +3976,6 @@ await appServerClient.sendRequest(
   nativeProjectlessAppServerParams,
   {{ signal: "native-projectless" }}
 );
-api.setThreadState({{ mode: "global-fast", defaultMode: "fast", entries: {{}} }});
 api.setBackendSettings({{ codexAppServiceTierControls: true }});
 localStorage.setItem("codexPlusSettings", JSON.stringify({{ serviceTierControls: true }}));
 const serviceTierClientCalls = [];
@@ -3913,10 +3984,23 @@ const serviceTierClient = {{
   async prewarmThreadStart(params) {{ serviceTierClientCalls.push({{ method: "prewarm", params }}); return {{ ok: true }}; }},
 }};
 const serviceTierClientPatched = api.patchAppServerClient(serviceTierClient);
-await serviceTierClient.sendRequest("turn/start", {{ threadId: "thread-service-tier", model: "gpt-5.4" }});
-await serviceTierClient.prewarmThreadStart({{ threadId: "thread-service-tier", model: "gpt-5.4" }});
+await serviceTierClient.sendRequest("turn/start", {{ threadId: "thread-service-tier", model: "gpt-5.4", serviceTier: "priority" }});
+await serviceTierClient.prewarmThreadStart({{ threadId: "thread-service-tier", model: "gpt-5.4", serviceTier: "priority" }});
 const serviceTierClientSendTier = serviceTierClientCalls[0]?.params?.serviceTier;
 const serviceTierClientPrewarmTier = serviceTierClientCalls[1]?.params?.serviceTier;
+// 运行中升级必须替换旧闭包，不能因为旧版本标记而保留旧 Fast 请求覆盖。
+const retiredCalls = [];
+const retiredOriginal = async (method, params) => {{ retiredCalls.push(params); return params; }};
+const retiredClient = {{
+  __codexPlusModelRequestPatch: "23",
+  __codexPlusModelOriginalSendRequest: retiredOriginal,
+  sendRequest: async (method, params) => retiredOriginal(method, {{ ...params, serviceTier: "legacy-forced-fast" }}),
+}};
+const retiredNativeParams = {{ threadId: "thread-retired-fast", model: "gpt-5.4", serviceTier: "default", service_tier: "priority" }};
+api.patchAppServerClient(retiredClient);
+await retiredClient.sendRequest("turn/start", retiredNativeParams);
+const retiredClientPatchReplaced = retiredCalls[0] === retiredNativeParams
+  && retiredCalls[0].serviceTier === "default" && retiredCalls[0].service_tier === "priority";
 const frozenClient = Object.preventExtensions({{ async sendRequest() {{ return {{ ok: true }}; }} }});
 const frozenClientPatchSkipped = api.patchAppServerClient(frozenClient) === false;
 const captureSample = "x" + String.fromCharCode(10) + "async sendRequest(e,t,n){{if(this.dispatchMessage==null)throw Error(`AppServerRequestClient is missing a message dispatcher`);}}";
@@ -3930,25 +4014,11 @@ window.__codexPlusAppServerClientClass = class CodexPlusTestClient {{
 }};
 const prototypePatched = api.installAppServerClientPrototypePatch();
 const protoClient = new window.__codexPlusAppServerClientClass();
-const protoTurn = await protoClient.sendRequest("turn/start", {{ threadId: "thread-prototype", model: "gpt-5.4" }});
-const protoPrewarm = await protoClient.prewarmThreadStart({{ threadId: "thread-prototype", model: "gpt-5.4" }});
+const protoTurn = await protoClient.sendRequest("turn/start", {{ threadId: "thread-prototype", model: "gpt-5.4", serviceTier: "priority" }});
+const protoPrewarm = await protoClient.prewarmThreadStart({{ threadId: "thread-prototype", model: "gpt-5.4", serviceTier: "priority" }});
 const prototypeSendTier = protoTurn && protoTurn.params ? protoTurn.params.serviceTier : null;
 const prototypePrewarmTier = protoPrewarm && protoPrewarm.prewarm ? protoPrewarm.prewarm.serviceTier : null;
 const prototypeState = api.appServerClientPrototypeState();
-api.setThreadState({{ mode: "inherit", defaultMode: "inherit", entries: {{}} }});
-api.setBackendSettings({{ codexAppServiceTierControls: false }});
-api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4"], service_tier: "fast" }});
-const resolvedConfigTomlTier = await api.resolveInheritedServiceTier();
-api.setModelCatalog({{ status: "ok", model: "gpt-5.4", default_model: "gpt-5.4", models: ["gpt-5.4"] }});
-const resolvedUnsetTier = await api.resolveInheritedServiceTier();
-api.setModelCatalog({{ status: "ok", model: "gpt-4.1", default_model: "gpt-4.1", models: ["gpt-4.1"] }});
-api.setThreadState({{ mode: "inherit", defaultMode: "inherit", entries: {{}} }});
-api.setServiceTierState({{ status: "ok", serviceTier: null, configServiceTier: "fast", serviceTierSource: "config-toml" }});
-const inheritedConfigFastBlocked = api.applyServiceTierOverride("turn/start", {{
-  threadId: "thread-12345678",
-  model: "gpt-4.1",
-  service_tier: null,
-}}, "");
 const appServerParamsUnchanged = appServerCalls[0]?.params === nativeAppServerParams
   && appServerCalls[0]?.params?.workspaceKind === "project"
   && appServerCalls[0]?.params?.cwd === "C:/native/work"
@@ -3980,7 +4050,7 @@ const explicitOtherProvider = {{ cwd: "C:/mobile", modelProvider: "other" }};
 const providerFromOther = api.applyProviderOverride("thread/start", explicitOtherProvider);
 const nonThreadParams = {{ cwd: "C:/mobile", modelProvider: "openai" }};
 const nonThreadProviderUnchanged = api.applyProviderOverride("turn/start", nonThreadParams) === nonThreadParams;
-const providerWithServiceTierControlsDisabled = api.requestOverride({{
+const providerWithLegacyControlsIgnored = api.requestOverride({{
   type: "start-conversation",
   cwd: "C:/mobile",
   modelProvider: "openai",
@@ -4236,9 +4306,11 @@ const pureApiThreadResumeParams = {{
   threadId: "thread-mobile-pure-api",
   model_provider: "openai",
 }};
-const pureApiThreadResumeUnchanged = api.applyProviderOverride("thread/resume", pureApiThreadResumeParams) === pureApiThreadResumeParams;
+const pureApiThreadResumeProvider = api.applyProviderOverride("thread/resume", pureApiThreadResumeParams)?.modelProvider;
 const pureApiNativeResumeParams = {{ threadId: "thread-mobile-native-resume" }};
-const pureApiNativeResumeUnchanged = api.applyProviderOverride("thread/resume", pureApiNativeResumeParams) === pureApiNativeResumeParams;
+const pureApiNativeResumeProvider = api.applyProviderOverride("thread/resume", pureApiNativeResumeParams)?.modelProvider;
+const explicitResume = {{ threadId: "thread-other-provider", modelProvider: "other", model: "gpt-custom", reasoningEffort: "high" }};
+const pureApiExplicitResumePreserved = api.applyProviderOverride("thread/resume", explicitResume) === explicitResume;
 const pureApiTurnStartProvider = api.applyProviderOverride("turn/start", {{
   threadId: "thread-mobile-pure-api",
   modelProvider: "openai",
@@ -4258,6 +4330,8 @@ api.setBackendSettings({{
 }});
 const pureOfficialParams = {{ cwd: "C:/mobile", modelProvider: "openai" }};
 const pureOfficialProviderUnchanged = api.applyProviderOverride("thread/start", pureOfficialParams) === pureOfficialParams;
+const officialResume = {{ threadId: "thread-official", modelProvider: "openai" }};
+const officialResumePreserved = api.applyProviderOverride("thread/resume", officialResume) === officialResume;
 api.setBackendSettings({{
   relayProfilesEnabled: true,
   activeRelayId: "per-model-context",
@@ -4326,19 +4400,208 @@ await failedModelSwitchClient.sendRequest("turn/start", {{
 }});
 const failedModelSwitchResumeAttempts = failedModelSwitchCalls.filter((call) => call.method === "thread/resume").length;
 const failedModelSwitchTurnAttempts = failedModelSwitchCalls.filter((call) => call.method === "turn/start").length;
+
+let finishDelayedResume;
+const delayedResumeCalls = [];
+const delayedResumeClient = {{
+  async sendRequest(method) {{
+    delayedResumeCalls.push(method);
+    return method === "thread/resume" ? new Promise((resolve) => {{ finishDelayedResume = resolve; }}) : {{ ok: true }};
+  }},
+}};
+api.patchAppServerClient(delayedResumeClient);
+await delayedResumeClient.sendRequest("thread/start", {{ threadId: "delayed-resume", model: "model-old" }});
+const delayedResumeTurn = delayedResumeClient.sendRequest("turn/start", {{ threadId: "delayed-resume", model: "model-new" }});
+await new Promise(setImmediate);
+const delayedResumeWaited = delayedResumeCalls.at(-1) === "thread/resume" && !delayedResumeCalls.includes("turn/start");
+finishDelayedResume({{ ok: true }});
+await delayedResumeTurn;
+
+async function expectNativeRequestCompletes(promise) {{
+  let timeoutId;
+  try {{
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {{ timeoutId = setTimeout(() => reject(new Error("native request remained blocked")), 5000); }}),
+    ]);
+  }} finally {{ clearTimeout(timeoutId); }}
+}}
+const hungSettingsForwarded = [];
+const lateSettingsIgnored = [];
+for (const kind of ["instance", "prototype"]) {{
+  api.setBackendSettings({{
+    relayProfilesEnabled: true,
+    activeRelayId: "hung-settings",
+    activeRelayCodexProvider: "stale_vendor",
+    relayProfiles: [{{ id: "hung-settings", relayMode: "pureApi", officialMixApiKey: true, configContents: 'model_provider = "stale_vendor"' }}],
+  }});
+  let resolveSettings;
+  window.__codexSessionDeleteBridge = (path) => path === "/settings/get"
+    ? new Promise((resolve) => {{ resolveSettings = resolve; }})
+    : Promise.resolve({{ status: "ok" }});
+  const nativeParams = {{ threadId: `hung-settings-${{kind}}`, model: "gpt-5.4", modelProvider: "openai" }};
+  const nativeOptions = {{ marker: kind }};
+  class HungSettingsClient {{
+    async sendRequest(method, params, options) {{
+      if (method !== "turn/start" || params.modelProvider !== "openai" || options !== nativeOptions) {{
+        throw new Error("failed settings read changed native request");
+      }}
+      hungSettingsForwarded.push(kind);
+      return {{ nativeComplete: true }};
+    }}
+  }}
+  const client = new HungSettingsClient();
+  if (kind === "instance") {{
+    api.patchAppServerClient(client);
+  }} else {{
+    delete window.__codexPlusAppServerClientPrototypePatchInstalled;
+    window.__codexPlusAppServerClientClass = HungSettingsClient;
+    api.installAppServerClientPrototypePatch();
+  }}
+  await expectNativeRequestCompletes(client.sendRequest("turn/start", nativeParams, nativeOptions));
+  resolveSettings({{
+    enhancementsEnabled: true,
+    activeRelayCodexProvider: "late_vendor",
+    relayProfiles: [{{ id: "hung-settings", relayMode: "pureApi", officialMixApiKey: true, configContents: 'model_provider = "late_vendor"' }}],
+  }});
+  await new Promise(setImmediate);
+  lateSettingsIgnored.push(api.applyProviderOverride("thread/start", {{ modelProvider: "openai" }})?.modelProvider);
+}}
+
+api.setBackendSettings({{ relayProfilesEnabled: false, codexAppModelWhitelistUnlock: true }});
+api.setModelCatalog({{ model: "", default_model: "", models: [] }});
+let resolveCatalog;
+let catalogReadFinished = false;
+window.__codexSessionDeleteBridge = (path) => path === "/codex-model-catalog"
+  ? new Promise((resolve) => {{ resolveCatalog = resolve; }})
+  : Promise.resolve({{ status: "ok" }});
+const catalogRead = api.loadModelCatalog(true).then((result) => {{ catalogReadFinished = true; return result; }});
+const catalogClient = {{
+  async sendRequest(method) {{ return method === "list-models-for-host" ? {{ data: [] }} : {{ nativeComplete: true }}; }},
+}};
+api.patchAppServerClient(catalogClient);
+const catalogTurn = await expectNativeRequestCompletes(catalogClient.sendRequest("turn/start", {{ threadId: "hung-catalog", model: "gpt-5.4" }}));
+const turnCompletedBeforeCatalogRead = catalogTurn.nativeComplete === true && !catalogReadFinished;
+const catalogList = await expectNativeRequestCompletes(catalogClient.sendRequest("list-models-for-host", {{}}));
+const hungCatalogListReturned = Array.isArray(catalogList.data) && catalogReadFinished;
+await catalogRead;
+resolveCatalog({{ status: "ok", model: "late-model", models: ["late-model"] }});
+await new Promise(setImmediate);
+const lateCatalogIgnored = (await api.loadModelCatalog())?.status;
+api.setBackendSettings({{
+  relayProfilesEnabled: true,
+  codexAppModelWhitelistUnlock: true,
+  activeRelayId: "filter-profile",
+  relayProfiles: [{{ id: "filter-profile", relayMode: "pureApi" }}],
+}});
+const supplierCatalog = {{ status: "ok", model_provider: "filter-profile", model: "relay-model", default_model: "relay-model", models: ["relay-model", "gpt-5.6-sol"] }};
+api.setModelCatalog(supplierCatalog);
+const pureApiContainer = {{
+  models: [{{ model: "gpt-unavailable" }}, {{ model: "gpt-5.6-sol" }}],
+  availableModels: ["gpt-unavailable", "gpt-5.6-sol"],
+  available_models: new Set(["gpt-unavailable", "gpt-5.6-sol"]),
+  defaultModel: {{ model: "gpt-unavailable" }},
+  default_model: "gpt-unavailable",
+}};
+api.patchModelContainer(pureApiContainer);
+const pureApiFilteredModels = pureApiContainer.models.map((item) => item.model);
+const pureApiFilteredNames = [...pureApiContainer.availableModels];
+const pureApiFilteredSet = [...pureApiContainer.available_models];
+const pureApiDefaultModel = pureApiContainer.defaultModel.model;
+const statsigContainer = {{ value: {{ available_models: ["gpt-unavailable", "gpt-5.6-sol"], default_model: "gpt-unavailable" }} }};
+const pureApiStatsigFiltered = api.patchStatsigModelDynamicConfig(statsigContainer).value.available_models;
+const pureApiStatsigDefault = statsigContainer.value.default_model;
+api.setBackendSettings({{ relayProfiles: [{{ id: "filter-profile", relayMode: "official" }}] }});
+api.patchModelContainer(pureApiContainer);
+api.patchStatsigModelDynamicConfig(statsigContainer);
+const modelsRestoredAfterModeChange = pureApiContainer.models.some((item) => item.model === "gpt-unavailable")
+  && pureApiContainer.availableModels.includes("gpt-unavailable") && pureApiContainer.available_models.has("gpt-unavailable")
+  && pureApiContainer.defaultModel.model === "gpt-unavailable" && pureApiContainer.default_model === "gpt-unavailable"
+  && statsigContainer.value.available_models.includes("gpt-unavailable") && statsigContainer.value.default_model === "gpt-unavailable";
+api.setBackendSettings({{ relayProfiles: [{{ id: "filter-profile", relayMode: "pureApi" }}] }});
+api.patchModelContainer(pureApiContainer);
+api.setModelCatalog({{ status: "failed", model: "", default_model: "", models: [] }});
+api.patchModelContainer(pureApiContainer);
+const modelsRestoredAfterCatalogFailure = pureApiContainer.models.some((item) => item.model === "gpt-unavailable")
+  && pureApiContainer.defaultModel.model === "gpt-unavailable";
+api.setModelCatalog(supplierCatalog);
+const unfilteredModelScenarios = [];
+for (const scenario of ["official", "mixed", "failed", "not-configured", "stale-profile"]) {{
+  api.setBackendSettings({{ relayProfiles: [{{ id: "filter-profile", relayMode: scenario === "official" || scenario === "mixed" ? "official" : "pureApi", officialMixApiKey: scenario === "mixed" }}] }});
+  api.setModelCatalog({{ ...supplierCatalog, status: scenario === "failed" ? "failed" : scenario === "not-configured" ? "not_configured" : "ok", model_provider: scenario === "stale-profile" ? "previous-profile" : "filter-profile" }});
+  const nativeModels = [{{ model: "gpt-unavailable" }}];
+  api.patchModelArray(nativeModels);
+  unfilteredModelScenarios.push(nativeModels.some((item) => item.model === "gpt-unavailable"));
+}}
+api.setBackendSettings({{ relayProfiles: [{{ id: "filter-profile", relayMode: "pureApi" }}] }});
+api.setModelCatalog(supplierCatalog);
+api.patchModelContainer(pureApiContainer);
+delete require.cache[require.resolve(scriptPath)];
+require(scriptPath);
+const reinjectedApi = window.__codexPlusServiceTierTest;
+reinjectedApi.setBackendSettings({{ relayProfilesEnabled: true, codexAppModelWhitelistUnlock: true, activeRelayId: "filter-profile", relayProfiles: [{{ id: "filter-profile", relayMode: "official" }}] }});
+reinjectedApi.setModelCatalog(supplierCatalog);
+reinjectedApi.patchModelContainer(pureApiContainer);
+const modelsRestoredAfterReinjection = pureApiContainer.models.some((item) => item.model === "gpt-unavailable")
+  && pureApiContainer.available_models.has("gpt-unavailable") && pureApiContainer.defaultModel.model === "gpt-unavailable";
+reinjectedApi.setBackendSettings({{ relayProfiles: [{{ id: "filter-profile", relayMode: "pureApi" }}] }});
+const sharedHostModels = [{{ model: "gpt-5.6-sol" }}, {{ model: "remote-qwen" }}];
+class ScopedModelClient {{
+  constructor(hostId) {{ this.hostId = hostId; }}
+  async sendRequest() {{ return {{ data: sharedHostModels }}; }}
+}}
+const localModelClient = new ScopedModelClient("local");
+const remoteModelClient = new ScopedModelClient("ssh:test");
+reinjectedApi.patchAppServerClient(localModelClient);
+reinjectedApi.patchAppServerClient(remoteModelClient);
+await localModelClient.sendRequest("model/list", {{}});
+const localRemovedRemote = !sharedHostModels.some((item) => item.model === "remote-qwen");
+await remoteModelClient.sendRequest("model/list", {{}});
+const remoteModelsPreservedForSharedCache = localRemovedRemote && sharedHostModels.some((item) => item.model === "remote-qwen");
+window.__codexPlusAppServerClientClass = class ScopedProtoModelClient {{
+  constructor(hostId) {{ this.hostId = hostId; }}
+  async sendRequest() {{ return {{ data: sharedHostModels }}; }}
+}};
+delete window.__codexPlusAppServerClientPrototypePatchInstalled;
+reinjectedApi.installAppServerClientPrototypePatch();
+await new window.__codexPlusAppServerClientClass("local").sendRequest("list-models-for-host", {{ hostId: "local" }});
+await new window.__codexPlusAppServerClientClass("ssh:test").sendRequest("list-models-for-host", {{ hostId: "local" }});
+const remotePrototypeModelsPreserved = sharedHostModels.some((item) => item.model === "remote-qwen");
+await localModelClient.sendRequest("model/list", {{}});
+const unknownModelClient = new ScopedModelClient(undefined);
+reinjectedApi.patchAppServerClient(unknownModelClient);
+await unknownModelClient.sendRequest("model/list", {{}});
+const unknownHostModelsPreserved = sharedHostModels.some((item) => item.model === "remote-qwen");
+const remoteJson = {{ hostId: "ssh:test", models: [{{ model: "remote-qwen" }}] }};
+await reinjectedApi.patchModelJsonResponse(remoteJson);
+reinjectedApi.recordModelListRequest("remote-model-list", "ssh:test");
+const remoteMessage = {{ type: "mcp-response", hostId: "ssh:test", message: {{ id: "remote-model-list", result: {{ models: [{{ model: "remote-qwen" }}] }} }} }};
+reinjectedApi.patchMcpModelResponseData(remoteMessage);
+const remoteJsonAndMessageModelsPreserved = remoteJson.models.some((item) => item.model === "remote-qwen")
+  && remoteMessage.message.result.models.some((item) => item.model === "remote-qwen");
+const globalStatsigWithoutHost = {{ value: {{ available_models: ["remote-qwen"], default_model: "remote-qwen" }} }};
+reinjectedApi.patchStatsigModelDynamicConfig(globalStatsigWithoutHost, "");
+const globalStatsigWithoutHostPreserved = globalStatsigWithoutHost.value.available_models.includes("remote-qwen")
+  && globalStatsigWithoutHost.value.default_model === "remote-qwen";
+reinjectedApi.setBackendSettings({{ relayProfilesEnabled: false, codexAppModelWhitelistUnlock: false, codexAppServiceTierControls: false, codexAppSessionDelete: true }});
+window.__codexPlusAppServerClientClass = class DeleteOnlyNativeClient {{
+  constructor(hostId) {{ this.hostId = hostId; this.dispatchMessage = () => {{}}; }}
+  async sendRequest() {{
+    if (!this.dispatchMessage) throw new Error("AppServerRequestClient is missing a message dispatcher");
+    return {{ ok: true }};
+  }}
+}};
+delete window.__codexPlusAppServerClientPrototypePatchInstalled;
+const deleteOnlyInstalled = reinjectedApi.installAppServerClientPrototypePatch();
+const deleteOnlyClient = new window.__codexPlusAppServerClientClass("ssh:delete-only");
+await deleteOnlyClient.sendRequest("ping", {{}});
+const sessionDeleteOnlyRegistersNativeClient = deleteOnlyInstalled
+  && window.__codexPlusNativeHostClients.get("ssh:delete-only")?.ref?.deref() === deleteOnlyClient;
 process.stdout.write(JSON.stringify({{
-  supportedFast,
-  unsupportedModel,
-  turnWithoutModel,
-  turnWithoutModelDiagnosticModel,
-  customInheritUnsupported,
-  inheritUnsetStatus,
-  inheritFastStatus,
-  inheritStandardStatus,
-  inheritConfigTomlFastStatus,
-  resolvedConfigTomlTier,
-  resolvedUnsetTier,
-  inheritedConfigFastBlocked,
+  withoutNativeTier,
+  customModelNativeTier,
+  threadOnlyRequest,
+  customModelNativeSnakeTier,
   startConversation,
   explicitProjectStartConversation,
   projectlessStartConversation,
@@ -4360,6 +4623,7 @@ process.stdout.write(JSON.stringify({{
   serviceTierClientPatched,
   serviceTierClientSendTier,
   serviceTierClientPrewarmTier,
+  retiredClientPatchReplaced,
   frozenClientPatchSkipped,
   captureLine,
   captureColumn,
@@ -4373,7 +4637,7 @@ process.stdout.write(JSON.stringify({{
   providerFromOpenAi,
   providerFromOtherUnchanged: providerFromOther === explicitOtherProvider,
   nonThreadProviderUnchanged,
-  providerWithServiceTierControlsDisabled,
+  providerWithLegacyControlsIgnored,
   appServerProviderOverride,
   directThreadStartedId,
   nestedThreadStartedId,
@@ -4402,8 +4666,10 @@ process.stdout.write(JSON.stringify({{
   missingActiveProviderUnchanged,
   missingActiveRecoveryUnscheduled,
   pureApiThreadStartProvider,
-  pureApiThreadResumeUnchanged,
-  pureApiNativeResumeUnchanged,
+  pureApiThreadResumeProvider,
+  pureApiNativeResumeProvider,
+  pureApiExplicitResumePreserved,
+  officialResumePreserved,
   pureApiTurnStartProvider,
   pureApiTurnWithoutProviderUnchanged,
   pureApiOtherProviderUnchanged,
@@ -4413,6 +4679,28 @@ process.stdout.write(JSON.stringify({{
   modelSwitchResumeProvider,
   failedModelSwitchResumeAttempts,
   failedModelSwitchTurnAttempts,
+  delayedResumeWaited,
+  hungSettingsForwarded,
+  lateSettingsIgnored,
+  turnCompletedBeforeCatalogRead,
+  hungCatalogListReturned,
+  lateCatalogIgnored,
+  pureApiFilteredModels,
+  pureApiFilteredNames,
+  pureApiFilteredSet,
+  pureApiStatsigFiltered,
+  unfilteredModelScenarios,
+  pureApiDefaultModel,
+  pureApiStatsigDefault,
+  modelsRestoredAfterModeChange,
+  modelsRestoredAfterReinjection,
+  modelsRestoredAfterCatalogFailure,
+  remoteModelsPreservedForSharedCache,
+  remotePrototypeModelsPreserved,
+  unknownHostModelsPreserved,
+  remoteJsonAndMessageModelsPreserved,
+  sessionDeleteOnlyRegistersNativeClient,
+  globalStatsigWithoutHostPreserved,
 }}), () => process.exit(0));
 }}).catch((error) => {{
   console.error(error);
@@ -4462,94 +4750,6 @@ fn injection_script_restores_thread_scroll_positions() {
     assert!(script.contains("installThreadScrollRouteHooks"));
     assert!(script.contains("scheduleThreadScrollSync"));
     assert!(script.contains("localStorage.removeItem(codexThreadScrollKey)"));
-}
-
-#[test]
-fn injection_script_installs_upstream_branch_dropdown_adapter() {
-    let script = assets::injection_script(57321);
-
-    assert!(script.contains("installUpstreamBranchDropdownAdapter"));
-    assert!(!script.contains("installUpstreamPendingWorktreeDispatcherPatch"));
-    assert!(script.contains("data-codex-upstream-branch-option"));
-    assert!(script.contains("codexUpstreamBranchSelection"));
-    assert!(script.contains("/upstream-worktree/defaults"));
-    assert!(script.contains("/upstream-worktree/prepare"));
-    assert!(script.contains("injectUpstreamBranchOptions"));
-    assert!(script.contains("Upstream"));
-    assert!(script.contains("data-base-branch"));
-    assert!(script.contains("data-project-id"));
-    assert!(script.contains("MutationObserver"));
-    assert!(script.contains("upstreamWorktreePayloadFromSelection"));
-    assert!(script.contains("readUpstreamBranchSelection"));
-    assert!(script.contains("writeUpstreamBranchSelection(null)"));
-    assert!(script.contains("currentProjectRepoPathFromSelectedProjectButton"));
-    assert!(script.contains("currentProjectContextFromStartButton"));
-    assert!(script.contains("Start new chat in"));
-    assert!(script.contains("codexUpstreamProjectContext"));
-    assert!(script.contains("rememberStartNewChatProjectContext"));
-    assert!(script.contains("currentProjectContextForBranchMenu"));
-    assert!(script.contains("remoteProjectContextFromGlobalState"));
-    assert!(script.contains("upstreamBranchDefaultsInflight = new Map()"));
-    assert!(script.contains("upstreamRemoteBranchDefaultsCacheTtlMs"));
-    assert!(script.contains("upstreamBranchDefaultsInflight.delete(cacheKey)"));
-    assert!(script.contains("projectId:"));
-    assert!(script.contains("data-codex-upstream-branch-selection-label"));
-    assert!(script.contains("syncUpstreamBranchTriggerLabel"));
-    assert!(script.contains("syncUpstreamBranchMenuSelection"));
-    assert!(!script.contains("applyUpstreamPendingWorktreeOverride"));
-    assert!(!script.contains("pending-worktree-create"));
-    assert!(script.contains("qualifiedSourceRef"));
-    assert!(script.contains("refs/remotes/${remote}/${baseBranch}"));
-    assert!(!script.contains("startingState: { ...request.startingState, branchName: sourceRef }"));
-    assert!(script.contains("data-codex-upstream-branch-check"));
-    assert!(script.contains("data-codex-upstream-branch-icon"));
-    assert!(script.contains("branchIconSvg"));
-    assert!(script.contains("checkmarkSvg"));
-    assert!(script.contains("aria-checked"));
-    assert!(script.contains("check.removeAttribute(\"hidden\")"));
-    assert!(script.contains("check.setAttribute(\"hidden\", \"\")"));
-    assert!(script.contains("handleNativeBranchSelection"));
-    assert!(script.contains("clearUpstreamBranchTriggerLabel"));
-    assert!(!script.contains(r#"text.includes("/")"#));
-    assert!(script.contains("newWorktreeModeActive"));
-    assert!(script.contains("effectiveElementRect"));
-    assert!(script.contains("removeUpstreamBranchOptions"));
-    assert!(script.contains("cleanupInvalidUpstreamBranchOptions"));
-    assert!(script.contains("branchMenuInNewWorktreeMode"));
-    assert!(script.contains("branchMenuTriggerIsBranchControl"));
-    assert!(script.contains("actual-upstream-refs-v17"));
-    assert!(script.contains("create and checkout new branch"));
-    assert!(script.contains("if (/^start in"));
-    assert!(script.contains("if (!branchMenuInNewWorktreeMode(trigger))"));
-    assert!(script.contains("window.__codexUpstreamBranchDropdownObserver?.disconnect?.()"));
-    assert!(script.contains("record.addedNodes"));
-    assert!(script.contains("addedNodeContainsBranchMenu"));
-    assert!(!script.contains("new MutationObserver(schedule).observe"));
-    assert!(script.contains(r#".composer-footer button, .composer-footer [role="button"]"#));
-    assert!(!script.contains("return [...document.querySelectorAll('button')]"));
-}
-
-#[test]
-fn injection_script_prevents_switching_to_branches_used_by_other_worktrees() {
-    let script = assets::injection_script(57321);
-
-    assert!(script.contains("data-codex-branch-worktree-path"));
-    assert!(script.contains("annotateBranchMenuWorktreeUsage"));
-    assert!(script.contains("branchWorktreePathFromMenuItem"));
-    assert!(script.contains("该分支已在另一个 worktree 使用"));
-    assert!(script.contains("event.stopImmediatePropagation?.()"));
-}
-
-#[test]
-fn injection_script_rebuilds_upstream_options_for_each_project_branch_menu() {
-    let script = assets::injection_script(57321);
-
-    assert!(!script.contains("currentProjectRepoPathForBranchMenu"));
-    assert!(!script.contains("repoPathFromProjectLabel"));
-    assert!(script.contains("projectContextFromProjectLabel"));
-    assert!(script.contains("upstreamBranchOptionsMatchRefs"));
-    assert!(script.contains("upstreamBranchDefaultsCache = new Map()"));
-    assert!(script.contains("actual-upstream-refs-v17"));
 }
 
 #[test]
@@ -4605,6 +4805,15 @@ fn runtime_evaluate_params_sets_expected_flags() {
     let params = bridge::runtime_evaluate_params("1 + 1");
 
     assert_eq!(params["expression"], "1 + 1");
+    assert_eq!(params["awaitPromise"], false);
+    assert_eq!(params["allowUnsafeEvalBlockedByCSP"], true);
+}
+
+#[test]
+fn runtime_evaluate_params_return_by_value_sets_flag() {
+    let params = bridge::runtime_evaluate_params_return_by_value("({hello:\"world\"})");
+
+    assert_eq!(params["returnByValue"], true);
     assert_eq!(params["awaitPromise"], false);
     assert_eq!(params["allowUnsafeEvalBlockedByCSP"], true);
 }
@@ -4761,11 +4970,9 @@ fn pick_page_target_rejects_non_pages_and_pages_without_websocket() {
 
     let error = pick_page_target(&targets).expect_err("no injectable page should be selected");
 
-    assert!(
-        error
-            .to_string()
-            .contains("No injectable page target found")
-    );
+    assert!(error
+        .to_string()
+        .contains("No injectable page target found"));
 }
 
 #[test]
@@ -4790,11 +4997,9 @@ fn pick_injectable_codex_page_target_rejects_non_codex_pages() {
     let error = pick_injectable_codex_page_target(&targets)
         .expect_err("non-Codex page must not be selected for injection");
 
-    assert!(
-        error
-            .to_string()
-            .contains("No injectable Codex page target found")
-    );
+    assert!(error
+        .to_string()
+        .contains("No injectable Codex page target found"));
 }
 
 #[test]
@@ -4860,11 +5065,9 @@ fn pick_injectable_codex_page_target_rejects_embedded_browser_only_page() {
     let error = pick_injectable_codex_page_target(&targets)
         .expect_err("embedded browser content must not be selected for injection");
 
-    assert!(
-        error
-            .to_string()
-            .contains("No injectable Codex page target found")
-    );
+    assert!(error
+        .to_string()
+        .contains("No injectable Codex page target found"));
 }
 
 #[test]
@@ -5068,11 +5271,9 @@ fn quick_chat_only_target_is_not_injectable_as_codex_main_page() {
     let error = pick_injectable_codex_page_target(&targets)
         .expect_err("Quick Chat helper renderer must not be selected for injection");
 
-    assert!(
-        error
-            .to_string()
-            .contains("No injectable Codex page target found")
-    );
+    assert!(error
+        .to_string()
+        .contains("No injectable Codex page target found"));
 }
 
 #[test]
@@ -5082,15 +5283,23 @@ fn pick_injectable_codex_page_target_requires_websocket() {
     let error = pick_injectable_codex_page_target(&targets)
         .expect_err("Codex page without websocket must not be selected for injection");
 
-    assert!(
-        error
-            .to_string()
-            .contains("No injectable Codex page target found")
-    );
+    assert!(error
+        .to_string()
+        .contains("No injectable Codex page target found"));
 }
 
 #[tokio::test]
 async fn list_targets_can_query_ipv6_loopback_cdp_endpoint() {
+    // Windows 环境可能禁用 IPv6 loopback 访问；不可用时跳过这个环境专用回归。
+    let probe_listener = TcpListener::bind("[::1]:0")
+        .await
+        .expect("IPv6 loopback listener should bind");
+    let probe_addr = probe_listener.local_addr().unwrap();
+    if TcpStream::connect(probe_addr).await.is_err() {
+        return;
+    }
+    drop(probe_listener);
+
     let listener = TcpListener::bind("[::1]:0")
         .await
         .expect("IPv6 loopback listener should bind");
@@ -5162,12 +5371,10 @@ async fn install_bridge_routes_binding_while_waiting_for_command_response() {
 
         let response = recv_json(&mut socket).await;
         assert_eq!(response["method"], "Runtime.evaluate");
-        assert!(
-            response["params"]["expression"]
-                .as_str()
-                .expect("expression should be string")
-                .contains("__codexSessionDeleteResolve")
-        );
+        assert!(response["params"]["expression"]
+            .as_str()
+            .expect("expression should be string")
+            .contains("__codexSessionDeleteResolve"));
         send_json(&mut socket, json!({ "id": response["id"], "result": {} })).await;
         close_socket(&mut socket).await;
     })
@@ -5190,7 +5397,7 @@ async fn install_bridge_routes_binding_while_waiting_for_command_response() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge should not hang while processing interleaved binding call")
@@ -5246,7 +5453,7 @@ async fn install_bridge_immediately_evaluates_new_document_scripts() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(
+        install_test_bridge(
             &url,
             BRIDGE_BINDING_NAME,
             noop_handler(),
@@ -5304,12 +5511,10 @@ async fn install_bridge_returns_after_installing_and_keeps_message_pump_alive() 
         .await;
 
         let resolve = recv_json(&mut socket).await;
-        assert!(
-            resolve["params"]["expression"]
-                .as_str()
-                .expect("expression should be string")
-                .contains("after-return")
-        );
+        assert!(resolve["params"]["expression"]
+            .as_str()
+            .expect("expression should be string")
+            .contains("after-return"));
         send_json(&mut socket, json!({ "id": resolve["id"], "result": {} })).await;
         close_socket(&mut socket).await;
     })
@@ -5330,7 +5535,7 @@ async fn install_bridge_returns_after_installing_and_keeps_message_pump_alive() 
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(
+        install_test_bridge(
             &url,
             BRIDGE_BINDING_NAME,
             handler,
@@ -5367,7 +5572,7 @@ async fn install_bridge_command_error_mentions_method_and_id() {
     let handler = noop_handler();
     let error = tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge should not hang on CDP error response")
@@ -5423,33 +5628,25 @@ async fn install_bridge_rejects_bad_payload_with_id_and_continues_after_unparsea
         .await;
 
         let reject = recv_json(&mut socket).await;
-        assert!(
-            reject["params"]["expression"]
-                .as_str()
-                .expect("expression should be string")
-                .contains("__codexSessionDeleteReject")
-        );
-        assert!(
-            reject["params"]["expression"]
-                .as_str()
-                .expect("expression should be string")
-                .contains("bad-1")
-        );
+        assert!(reject["params"]["expression"]
+            .as_str()
+            .expect("expression should be string")
+            .contains("__codexSessionDeleteReject"));
+        assert!(reject["params"]["expression"]
+            .as_str()
+            .expect("expression should be string")
+            .contains("bad-1"));
         send_json(&mut socket, json!({ "id": reject["id"], "result": {} })).await;
 
         let resolve = recv_json(&mut socket).await;
-        assert!(
-            resolve["params"]["expression"]
-                .as_str()
-                .expect("expression should be string")
-                .contains("__codexSessionDeleteResolve")
-        );
-        assert!(
-            resolve["params"]["expression"]
-                .as_str()
-                .expect("expression should be string")
-                .contains("ok-1")
-        );
+        assert!(resolve["params"]["expression"]
+            .as_str()
+            .expect("expression should be string")
+            .contains("__codexSessionDeleteResolve"));
+        assert!(resolve["params"]["expression"]
+            .as_str()
+            .expect("expression should be string")
+            .contains("ok-1"));
         send_json(&mut socket, json!({ "id": resolve["id"], "result": {} })).await;
         close_socket(&mut socket).await;
     })
@@ -5457,7 +5654,7 @@ async fn install_bridge_rejects_bad_payload_with_id_and_continues_after_unparsea
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[]),
     )
     .await
     .expect("bridge should not hang after bad payload")
@@ -5518,7 +5715,7 @@ async fn install_bridge_queues_consecutive_bindings_without_recursive_dispatch()
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge should not hang while draining queued binding calls")
@@ -5588,7 +5785,7 @@ async fn install_bridge_does_not_wait_for_resolve_runtime_evaluate_ack() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge install should not wait for resolve ack")
@@ -5674,7 +5871,7 @@ async fn install_bridge_keeps_status_responsive_while_generate_is_pending() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
+        install_test_bridge(&url, BRIDGE_BINDING_NAME, handler, &[]),
     )
     .await
     .expect("bridge install should return while generate is pending")
@@ -5688,10 +5885,10 @@ async fn install_bridge_keeps_status_responsive_while_generate_is_pending() {
 async fn superseded_bridge_session_stops_answering_binding_calls() {
     let (url, stale_rx, fresh_rx) = spawn_two_session_cdp_server().await;
 
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("first bridge install should succeed");
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("second bridge install should succeed");
 
@@ -5778,18 +5975,19 @@ async fn superseded_bridge_session_closes_socket_without_incoming_messages() {
             }),
         )
         .await;
-        let fresh_resolved = tokio::time::timeout(Duration::from_secs(2), recv_text_message(&mut fresh))
-            .await
-            .is_ok_and(|message| {
-                message.is_some_and(|text| text.contains("__codexSessionDeleteResolve"))
-            });
+        let fresh_resolved =
+            tokio::time::timeout(Duration::from_secs(2), recv_text_message(&mut fresh))
+                .await
+                .is_ok_and(|message| {
+                    message.is_some_and(|text| text.contains("__codexSessionDeleteResolve"))
+                });
         let _ = fresh_alive_tx.send(fresh_resolved);
     });
 
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("first bridge install should succeed");
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("second bridge install should succeed");
 
@@ -5811,10 +6009,10 @@ async fn superseded_bridge_session_closes_socket_without_incoming_messages() {
 async fn failed_bridge_reinstall_keeps_existing_session_current() {
     let (url, active_rx, failed_rx) = spawn_failed_reinstall_cdp_server().await;
 
-    bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect("first bridge install should succeed");
-    let error = bridge::install_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
+    let error = install_test_bridge(&url, BRIDGE_BINDING_NAME, noop_handler(), &[])
         .await
         .expect_err("second bridge install should fail");
     assert!(error.to_string().contains("Runtime.addBinding"));
@@ -5887,8 +6085,8 @@ async fn spawn_two_session_cdp_server() -> (String, oneshot::Receiver<bool>, one
     (websocket_url(address), stale_rx, fresh_rx)
 }
 
-async fn spawn_failed_reinstall_cdp_server()
--> (String, oneshot::Receiver<bool>, oneshot::Receiver<()>) {
+async fn spawn_failed_reinstall_cdp_server(
+) -> (String, oneshot::Receiver<bool>, oneshot::Receiver<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("test listener should bind");
@@ -5982,6 +6180,86 @@ async fn recv_text_message(socket: &mut TestSocket) -> Option<String> {
     }
 }
 
+#[tokio::test]
+async fn extension_cdp_evaluate_returns_objects_and_arrays_by_value() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("cdp listener should bind");
+    let port = listener.local_addr().expect("listener address").port();
+    let websocket = format!("ws://127.0.0.1:{port}/devtools/page/overlay");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let websocket = websocket.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut peeked = [0_u8; 2048];
+                let peeked_len = stream.peek(&mut peeked).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&peeked[..peeked_len]);
+                if head.contains("GET /json") {
+                    let mut buf = vec![0_u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let body = json!([{
+                        "id": "overlay",
+                        "type": "page",
+                        "title": "overlay",
+                        "url": "app://-/index.html?initialRoute=%2Favatar-overlay",
+                        "webSocketDebuggerUrl": websocket,
+                    }])
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    return;
+                }
+                let mut socket = accept_async(stream)
+                    .await
+                    .expect("websocket should upgrade");
+                let command = recv_json(&mut socket).await;
+                assert_eq!(command["method"], "Runtime.evaluate");
+                let by_value = command["params"]["returnByValue"] == true;
+                let expression = command["params"]["expression"].as_str().unwrap_or("");
+                // 不带 returnByValue 时，V8 对对象只回 objectId，value 为空。
+                let remote = if !by_value {
+                    json!({ "type": "object", "objectId": "obj-1" })
+                } else if expression.contains('[') {
+                    json!({ "type": "object", "value": [1, "two"] })
+                } else {
+                    json!({ "type": "object", "value": { "hello": "world" } })
+                };
+                send_json(
+                    &mut socket,
+                    json!({ "id": command["id"], "result": { "result": remote } }),
+                )
+                .await;
+                close_socket(&mut socket).await;
+            });
+        }
+    });
+
+    let object = codex_plus_core::routes::evaluate_extension_cdp(
+        port,
+        &json!({ "kind": "avatar-overlay", "expression": "({hello:\"world\"})" }),
+    )
+    .await
+    .expect("object evaluation should succeed");
+    assert_eq!(object["results"][0]["ok"], true);
+    assert_eq!(object["results"][0]["value"]["hello"], "world");
+
+    let array = codex_plus_core::routes::evaluate_extension_cdp(
+        port,
+        &json!({ "kind": "avatar-overlay", "expression": "[1, \"two\"]" }),
+    )
+    .await
+    .expect("array evaluation should succeed");
+    assert_eq!(array["results"][0]["ok"], true);
+    assert_eq!(array["results"][0]["value"], json!([1, "two"]));
+}
+
 async fn spawn_cdp_server<F, Fut>(handler: F) -> (String, oneshot::Receiver<()>)
 where
     F: FnOnce(TestSocket) -> Fut + Send + 'static,
@@ -6044,6 +6322,23 @@ async fn close_socket(socket: &mut TestSocket) {
     let _ = tokio::time::timeout(Duration::from_millis(200), socket.next()).await;
 }
 
+async fn install_test_bridge(
+    websocket_url: &str,
+    binding_name: &str,
+    handler: bridge::BridgeHandler,
+    new_document_scripts: &[String],
+) -> anyhow::Result<()> {
+    // 桥接模拟协议使用缺省开关，不能受本机用户已开启的 Fast 等设置影响。
+    // 目录保留到进程结束，供安装后启动的后台任务继续读取。
+    static SETTINGS_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    SETTINGS_DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        codex_plus_core::paths::set_settings_path_for_tests(Some(dir.path().join("settings.json")));
+        dir
+    });
+    bridge::install_bridge(websocket_url, binding_name, handler, new_document_scripts).await
+}
+
 fn noop_handler() -> bridge::BridgeHandler {
     Arc::new(|_, _| {
         Box::pin(async { Ok(json!({ "status": "ok" })) })
@@ -6066,15 +6361,37 @@ fn parse_app_server_client_capture_location_reads_renderer_report() {
         "lineNumber": 1796_u64,
         "columnNumber": 87512_u64,
     });
-    let (url_regex, line, column) =
-        bridge::parse_app_server_client_capture_location(&serde_json::Value::String(
-            report.to_string(),
-        ))
-        .expect("renderer report should parse");
+    let (url_regex, line, column) = bridge::parse_app_server_client_capture_location(
+        &serde_json::Value::String(report.to_string()),
+    )
+    .expect("renderer report should parse");
     assert_eq!(url_regex, "app://-/assets/app-initial-abc123.js");
     assert_eq!(line, 1796);
     assert_eq!(column, 87512);
     assert!(bridge::parse_app_server_client_capture_location(&json!("null")).is_none());
     assert!(bridge::parse_app_server_client_capture_location(&json!("{}")).is_none());
     assert!(bridge::parse_app_server_client_capture_location(&json!("")).is_none());
+}
+
+#[test]
+fn injection_script_has_no_retired_remote_worktree_entrypoints() {
+    let script = assets::injection_script(57321);
+    for removed in [
+        "installUpstreamBranchDropdownAdapter",
+        "annotateBranchMenuWorktreeUsage",
+        "data-codex-branch-worktree-path",
+        "/upstream-worktree/",
+        "/zed-remote/",
+    ] {
+        assert!(!script.contains(removed), "retired entrypoint: {removed}");
+    }
+}
+
+#[test]
+fn injection_script_preserves_native_menu_placement_without_language_rewrites() {
+    let script = assets::injection_script(57321);
+    assert!(script.contains("nativeMenuPlacement"));
+    assert!(!script.contains("codexMenuLocalizationMap"));
+    assert!(!script.contains("function localizeCodexMenus"));
+    assert!(!script.contains("localizeCodexMenus();"));
 }

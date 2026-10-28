@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Codex++ Linux .deb 打包脚本
-# 用法: sudo bash scripts/installer/linux/build-deb.sh [VERSION]
+# Usage: bash scripts/installer/linux/build-deb.sh [--package-only|--frontend-only|--rust-only|--deps-only] [VERSION]
 #       或分步执行下面的各个函数
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,40 +11,38 @@ PROJECT_DIR="$REPO_DIR/apps/codex-plus-manager"
 BUILD_DIR="$REPO_DIR/.linux-build"
 DEB_DIR="$BUILD_DIR/deb"
 PACKAGE_NAME="codex-plus-plus"
-# 自动读取 package.json 版本号作为默认版本
-DEFAULT_VERSION="1.5.0"
-if [ -f "$PROJECT_DIR/package.json" ]; then
-    DEFAULT_VERSION="$(node -p 'try{require("./apps/codex-plus-manager/package.json").version || "1.5.0"}catch(e){"1.5.0"}' 2>/dev/null || echo "1.5.0")"
-fi
-
 ACTION="all"
-VERSION="$DEFAULT_VERSION"
-
+VERSION=""
 for arg in "$@"; do
     case "$arg" in
-        --package-only)
-            ACTION="package"
-            ;;
-        --frontend-only)
-            ACTION="frontend"
-            ;;
-        --rust-only)
-            ACTION="rust"
-            ;;
-        --deps-only)
-            ACTION="deps"
-            ;;
+        --package-only) ACTION="package" ;;
+        --frontend-only) ACTION="frontend" ;;
+        --rust-only) ACTION="rust" ;;
+        --deps-only) ACTION="deps" ;;
         -h|--help)
-            echo "用法: $0 [--package-only|--frontend-only|--rust-only|--deps-only] [VERSION]"
+            echo "Usage: $0 [--package-only|--frontend-only|--rust-only|--deps-only] [VERSION]"
             exit 0
             ;;
+        --*) echo "error: unknown option $arg" >&2; exit 2 ;;
         *)
-            if [[ ! "$arg" =~ ^-- ]]; then
-                VERSION="$arg"
-            fi
+            if [ -n "$VERSION" ]; then echo "error: multiple VERSION arguments" >&2; exit 2; fi
+            VERSION="$arg"
             ;;
     esac
 done
+
+# Absolute path: works from any current directory, with no silent stale-version fallback.
+if [ -z "$VERSION" ]; then
+    if ! command -v node >/dev/null 2>&1; then
+        echo "error: Node.js is required to read the default package version; supply VERSION explicitly" >&2
+        exit 1
+    fi
+    VERSION="$(node -e 'const p = require(process.argv[1]); if (!p.version) process.exit(1); process.stdout.write(p.version)' "$PROJECT_DIR/package.json")"
+fi
+if ! dpkg --validate-version "$VERSION" >/dev/null 2>&1; then
+    echo "error: invalid Debian package version: $VERSION" >&2
+    exit 1
+fi
 ARCH="$(dpkg --print-architecture)"
 # Node / 包管理器：优先从环境变量取，其次探测 PATH。
 # 不要写死绝对路径——这里是给所有贡献者和 CI 用的，不是某台机器的构建脚本。
@@ -80,51 +78,30 @@ install_system_deps() {
 
 # ── 2. 安装 Rust toolchain（无需 sudo）───────────────────────
 install_rust() {
-    if [ -f "$HOME/.cargo/env" ]; then
-        . "$HOME/.cargo/env"
-    fi
+    if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
     if command -v cargo &>/dev/null; then
         echo ">>> Rust 已安装: $(cargo --version)"
         return
     fi
     echo ">>> 安装 Rust toolchain (rustup)..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-    if [ -f "$HOME/.cargo/env" ]; then
-        . "$HOME/.cargo/env"
-    fi
+    . "$HOME/.cargo/env"
     echo ">>> Rust 安装完成: $(cargo --version)"
 }
 
 # ── 3. 构建前端 ──────────────────────────────────────────────
 build_frontend() {
     echo ">>> 构建前端..."
-    cd "$PROJECT_DIR"
-    if [ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ]; then
-        export PATH="$(dirname "$NODE_BIN"):$PATH"
-    fi
-
-    if command -v npm &>/dev/null; then
-        npm ci || npm install
-        npm run vite:build
-    elif command -v pnpm &>/dev/null; then
-        pnpm install
-        pnpm run vite:build
-    elif [ -n "$PNPM_BIN" ] && [ -x "$PNPM_BIN" ]; then
-        export PATH="$(dirname "$PNPM_BIN"):$PATH"
-        "$PNPM_BIN" install
-        node_modules/.bin/vite build
-    else
-        echo "error: 找不到 npm 或 pnpm。请安装 npm/pnpm 后重试。" >&2
-        return 1
-    fi
+    if [ -n "$NODE_BIN" ] && [ -x "$NODE_BIN" ]; then export PATH="$(dirname "$NODE_BIN"):$PATH"; fi
+    if ! command -v npm >/dev/null 2>&1; then echo "error: npm is required (npm ci)" >&2; return 1; fi
+    ( cd "$PROJECT_DIR" && npm ci && npm run vite:build )
     echo ">>> 前端构建完成"
 }
-
 # ── 4. 构建 Rust 二进制 ──────────────────────────────────────
 build_rust() {
     echo ">>> 构建 Rust 二进制..."
     export PATH="$HOME/.cargo/bin:$PATH"
-    cargo build --release -p codex-plus-launcher -p codex-plus-manager
+    ( cd "$REPO_DIR" && cargo build --release -p codex-plus-manager )
     echo ">>> Rust 构建完成"
 }
 
@@ -151,10 +128,8 @@ package_deb() {
     mkdir -p "$stage/lib/${PACKAGE_NAME}"
 
     # ── 复制二进制 ──
-    cp "$REPO_DIR/target/release/codex-plus-plus"          "$stage/bin/"
-    cp "$REPO_DIR/target/release/codex-plus-plus-manager"  "$stage/bin/"
+    cp "$REPO_DIR/target/release/codex-plus-plus" "$stage/bin/"
     chmod 755 "$stage/bin/codex-plus-plus"
-    chmod 755 "$stage/bin/codex-plus-plus-manager"
 
     # ── 复制前端资源 ──
     if [ -d "$PROJECT_DIR/dist" ]; then
@@ -164,33 +139,21 @@ package_deb() {
     # ── 复制图标 ──
     local icon_src="$PROJECT_DIR/src-tauri/icons/icon.png"
     if [ -f "$icon_src" ]; then
-        cp "$icon_src" "$stage/share/icons/hicolor/128x128/apps/${PACKAGE_NAME}-manager.png"
         cp "$icon_src" "$stage/share/icons/hicolor/128x128/apps/${PACKAGE_NAME}.png"
     fi
 
     # ── Desktop 文件 ──
-    cat > "$stage/share/applications/${PACKAGE_NAME}-launcher.desktop" <<'EOF'
+    cat > "$stage/share/applications/${PACKAGE_NAME}.desktop" <<'EOF'
 [Desktop Entry]
 Name=Codex++
-Comment=Codex++ Launcher - silently launch the official Codex desktop app
-Exec=codex-plus-plus
+Comment=Configure and launch the official Codex desktop app
+Exec=codex-plus-plus %u
 Icon=codex-plus-plus
 Type=Application
 Categories=Development;Utility;
 Terminal=false
 StartupNotify=true
-EOF
-
-    cat > "$stage/share/applications/${PACKAGE_NAME}-manager.desktop" <<'EOF'
-[Desktop Entry]
-Name=Codex++ Manager
-Comment=Codex++ Manager - configure providers, models, enhancements
-Exec=codex-plus-plus-manager
-Icon=codex-plus-plus-manager
-Type=Application
-Categories=Development;Utility;
-Terminal=false
-StartupNotify=true
+MimeType=x-scheme-handler/codexplusplus;x-scheme-handler/dreamskin;
 EOF
 
     # ── 复制文档 ──
@@ -200,8 +163,7 @@ EOF
 
     # ── control 文件 ──
     local installed_size
-    installed_size=$(du -sk "$DEB_DIR" | awk '{print $1}')
-
+    installed_size=$(du -sk "$stage" | awk '{print $1}')
     cat > "$DEB_DIR/DEBIAN/control" <<EOF
 Package: ${PACKAGE_NAME}
 Version: ${VERSION}
@@ -210,16 +172,15 @@ Priority: optional
 Architecture: ${ARCH}
 Maintainer: BigPizzaV3 <1727732@qq.com>
 Installed-Size: ${installed_size}
-Depends: libc6 (>= 2.34), libgcc-s1 (>= 4.2), libstdc++6 (>= 13), libdbus-1-3, libglib2.0-0 | libglib2.0-0t64, libgtk-3-0 | libgtk-3-0t64, libwebkit2gtk-4.1-0, libsoup-3.0-0, libjavascriptcoregtk-4.1-0, libssl3 | libssl3t64, libayatana-appindicator3-1
+Depends: libc6 (>= 2.34), libgcc-s1 (>= 4.2), libstdc++6 (>= 13), libdbus-1-3, libglib2.0-0t64, libgtk-3-0t64, libwebkit2gtk-4.1-0, libsoup-3.0-0, libjavascriptcoregtk-4.1-0, libssl3t64 (>= 3.0.0), libz3-4, libatspi2.0-0t64, libasound2t64
 Recommends: codex
-Description: Codex++ is an external launcher and manager for OpenAI Codex / ChatGPT desktop apps.
+Description: Codex++ configures and launches OpenAI Codex / ChatGPT desktop apps.
  It provides provider switching, protocol conversion, session management and UI enhancements
  via Chromium DevTools Protocol and a local helper service, without modifying the official
  app.asar or writing patches to the installation directory.
  .
- Includes two components:
-  - codex-plus-plus: silently launches the official Codex desktop app
-  - codex-plus-plus-manager: manages providers, models, plugins, sessions, enhancements
+ Includes one application, codex-plus-plus, for provider and model configuration,
+ sessions, enhancements and launching the official desktop app from its window.
 EOF
 
     # ── postinst 脚本 ──
@@ -255,35 +216,19 @@ EOF
 # ── 主流程 ─────────────────────────────────────────────────
 main() {
     case "$ACTION" in
-        deps)
-            install_system_deps
-            install_rust
-            ;;
-        frontend)
-            build_frontend
-            ;;
-        rust)
-            build_rust
-            ;;
-        package)
-            package_deb
-            ;;
-        all)
-            install_system_deps
-            install_rust
-            build_frontend
-            build_rust
-            package_deb
-            ;;
+        deps) install_system_deps; install_rust ;;
+        frontend) build_frontend ;;
+        rust) build_rust ;;
+        package) package_deb ;;
+        all) install_system_deps; install_rust; build_frontend; build_rust; package_deb ;;
     esac
 
     echo ""
     echo "=== 完成 ==="
-    if [ "$ACTION" = "all" ] || [ "$ACTION" = "package" ]; then
+    if [ "$ACTION" = "package" ] || [ "$ACTION" = "all" ]; then
         local deb_name="${PACKAGE_NAME}_${VERSION}_${ARCH}.deb"
         echo "Deb 包路径: $REPO_DIR/dist/linux/$deb_name"
-        echo ""
-        echo "安装命令: sudo dpkg -i $REPO_DIR/dist/linux/$deb_name"
+        echo "安装命令: sudo apt install $REPO_DIR/dist/linux/$deb_name"
     fi
 }
 
